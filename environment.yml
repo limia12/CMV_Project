@@ -1,0 +1,9 @@
+name: CMV_Project
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - bash
+  - curl
+  - wget
+  - git
