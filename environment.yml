@@ -7,3 +7,4 @@ dependencies:
   - curl
   - wget
   - git
+  - parallel
