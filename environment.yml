@@ -2,9 +2,18 @@ name: CMV_Project
 channels:
   - defaults
   - conda-forge
+  - bioconda
 dependencies:
   - bash
   - curl
   - wget
   - git
   - parallel
+  - trim-galore
+  - fastuniq
+  - fastqc
+  - samtools
+  - bowtie2
+  - trimmomatic
+  - picard
+
