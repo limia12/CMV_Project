@@ -88,7 +88,9 @@ class PipelineGUI:
         self.log_text.insert(tk.END, "Pipeline logs will appear here...\n")
 
     def browse_path(self, step, label):
-        if "reference" in label.lower():
+        if "reference genome" in label.lower() and step in ["align_human", "align_cmv"]:
+            path = filedialog.askdirectory()
+        elif "reference" in label.lower():
             path = filedialog.askopenfilename(filetypes=[("FASTA files", "*.fa"), ("All files", "*.*")])
         elif "csv" in label.lower():
             path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
