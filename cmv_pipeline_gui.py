@@ -19,6 +19,7 @@ class PipelineGUI:
             "extract_unaligned": tk.BooleanVar(),
             "index_cmv": tk.BooleanVar(),
             "align_cmv": tk.BooleanVar(),
+            "conserved_coverage": tk.BooleanVar(),
         }
 
         self.paths = {}
@@ -39,7 +40,9 @@ class PipelineGUI:
                            variable=var, bg="#f0f0f0").grid(row=0, column=0, sticky='w', padx=10)
 
             self.paths[step] = {}
-            if step in ["align_human", "align_cmv"]:
+            if step == "conserved_coverage":
+                labels = ["Input BAM Dir", "Reference Genome", "Output CSV"]
+            elif step in ["align_human", "align_cmv"]:
                 labels = ["FASTQ Dir", "Reference Genome", "Output"]
             else:
                 labels = ["Input", "Output"]
@@ -87,6 +90,8 @@ class PipelineGUI:
     def browse_path(self, step, label):
         if "reference" in label.lower():
             path = filedialog.askopenfilename(filetypes=[("FASTA files", "*.fa"), ("All files", "*.*")])
+        elif "csv" in label.lower():
+            path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
         else:
             path = filedialog.askdirectory()
         if path:
@@ -96,6 +101,8 @@ class PipelineGUI:
     def run_script(self, script_name, *args):
         try:
             result = subprocess.run(["bash", script_name, *args], capture_output=True, text=True)
+            self.log_text.insert(tk.END, result.stdout + "\n")
+            self.log_text.yview(tk.END)
             if result.returncode != 0:
                 messagebox.showerror("Error", f"Error running {script_name}:\n{result.stderr}")
                 return
@@ -167,6 +174,16 @@ class PipelineGUI:
             else:
                 self.run_script("alignment_bwa-mem.sh", fastq_dir, reference_genome, output_dir)
             update_progress()
+
+        if self.steps["conserved_coverage"].get():
+            input_bam_dir = self.paths["conserved_coverage"]["input bam dir"].get()
+            reference_fasta = self.paths["conserved_coverage"]["reference genome"].get()
+            output_csv = self.paths["conserved_coverage"]["output csv"].get()
+            if not all([input_bam_dir, reference_fasta, output_csv]):
+                messagebox.showwarning("Missing Info", "Please provide all inputs for conserved coverage step.")
+            else:
+                self.run_script("conserved_coverage.sh", "-i", input_bam_dir, "-r", reference_fasta, "-o", output_csv)
+                update_progress()
 
         messagebox.showinfo("Pipeline Complete", "Pipeline execution is complete.")
         self.log_text.insert(tk.END, "Pipeline execution is complete.\n")
