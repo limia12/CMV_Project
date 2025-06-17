@@ -34,8 +34,8 @@ if [[ ! -f "$REFERENCE.fai" ]]; then
   samtools faidx "$REFERENCE"
 fi
 
-# Output header
-echo "Sample,Gene,Percent_Alignment" > "$OUTPUT"
+# Output header with new Depth column
+echo "Sample,Gene,Percent_Alignment,Average_Depth" > "$OUTPUT"
 
 regions=(
   "IE1:merlinGenome:172329-174090"
@@ -55,10 +55,17 @@ for bam in "$BAM_DIR"/*.bam; do
     IFS="-" read -r start end <<< "$coords"
     region_length=$((end - start + 1))
 
+    # Count covered bases (depth > 0)
     covered_bases=$(samtools depth -r "$chrom:$start-$end" "$bam" | awk '$3 > 0 {c++} END {print c+0}')
+
+    # Calculate percent covered
     percent=$(awk -v cov="$covered_bases" -v len="$region_length" 'BEGIN { printf "%.2f", (cov/len)*100 }')
 
-    echo "$sample,$gene,$percent" >> "$OUTPUT"
+    # Calculate average depth over the region
+    # If no coverage lines, avoid division by zero by setting depth=0
+    avg_depth=$(samtools depth -r "$chrom:$start-$end" "$bam" | awk '{sum+=$3; count++} END {if(count>0) printf "%.2f", sum/count; else print 0}')
+
+    echo "$sample,$gene,$percent,$avg_depth" >> "$OUTPUT"
   done
 done
 

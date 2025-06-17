@@ -56,7 +56,6 @@ class PipelineGUI:
                 self.paths[step][label.lower()] = entry
             row += 1
 
-        # Extra filtering options
         filter_frame = tk.Frame(main_frame, bg="#f0f0f0")
         filter_frame.grid(row=row, column=0, sticky='w', pady=5)
         tk.Label(filter_frame, text="Enter Quality Threshold:", bg="#f0f0f0").grid(row=0, column=0, padx=10, sticky="w")
@@ -68,32 +67,42 @@ class PipelineGUI:
         self.paths["filtering"]["num_cores"].grid(row=1, column=1, padx=5)
         row += 1
 
-        # Progress bar
         self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate", length=600)
         self.progress.grid(row=row, column=0, pady=10)
         row += 1
 
-        # Buttons
         button_frame = tk.Frame(main_frame, bg="#f0f0f0")
         button_frame.grid(row=row, column=0, pady=10)
         tk.Button(button_frame, text="Run Pipeline", command=self.run_pipeline,
                   width=20, bg="#4CAF50", fg="white", font=("Arial", 12)).grid(row=0, column=0, padx=5)
         tk.Button(button_frame, text="Open FastQC Reports", command=self.open_fastqc_reports,
                   width=20, bg="#2196F3", fg="white", font=("Arial", 12)).grid(row=0, column=1, padx=5)
+        tk.Button(button_frame, text="Open IGV", command=self.launch_igv,
+                  width=20, bg="#9C27B0", fg="white", font=("Arial", 12)).grid(row=0, column=2, padx=5)
         row += 1
 
-        # Log output
         self.log_text = scrolledtext.ScrolledText(main_frame, width=90, height=10, wrap=tk.WORD, font=("Arial", 10))
         self.log_text.grid(row=row, column=0, padx=10, pady=10)
         self.log_text.insert(tk.END, "Pipeline logs will appear here...\n")
 
     def browse_path(self, step, label):
-        if "reference genome" in label.lower() and step in ["align_human", "align_cmv"]:
-            path = filedialog.askdirectory()
-        elif "reference" in label.lower():
-            path = filedialog.askopenfilename(filetypes=[("FASTA files", "*.fa"), ("All files", "*.*")])
+        # For alignment steps, reference genome is a directory, not a file
+        if "reference genome" in label.lower():
+            # If step is align_human or align_cmv -> pick directory (genome index dir)
+            if step in ["align_human", "align_cmv"]:
+                path = filedialog.askdirectory(title=f"Select Reference Genome Directory for {step.replace('_', ' ').title()}")
+            else:
+                # For conserved_coverage or others, pick FASTA file as before
+                path = filedialog.askopenfilename(
+                    filetypes=[
+                        ("FASTA files", "*.fa *.fasta *.fna"),
+                        ("All files", "*.*")
+                    ]
+                )
         elif "csv" in label.lower():
             path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        elif "input" in label.lower():
+            path = filedialog.askdirectory()
         else:
             path = filedialog.askdirectory()
         if path:
@@ -200,7 +209,36 @@ class PipelineGUI:
             if file.endswith("_fastqc.html"):
                 webbrowser.open(f"file://{os.path.abspath(os.path.join(dir_path, file))}")
 
-if __name__ == '__main__':
+    def launch_igv(self):
+        # Ask user to select reference genome FASTA file
+        ref_path = filedialog.askopenfilename(
+            title="Select Reference Genome (FASTA)",
+            filetypes=[("FASTA files", "*.fa *.fasta *.fna"), ("All files", "*.*")]
+        )
+        if not ref_path:
+            return  # User cancelled
+
+        # Ask user to select BAM/VCF files
+        file_paths = filedialog.askopenfilenames(
+            title="Select BAM/VCF Files to Open in IGV",
+            filetypes=[
+                ("BAM files", "*.bam"),
+                ("VCF files", "*.vcf"),
+                ("All files", "*.*")
+            ]
+        )
+        if not file_paths:
+            return  # User cancelled
+
+        try:
+            # Launch IGV with the reference genome first, then the other files
+            subprocess.Popen(["igv", "-g", ref_path, *file_paths])
+            self.log_text.insert(tk.END, f"IGV launched with reference: {ref_path} and files: {file_paths}\n")
+            self.log_text.yview(tk.END)
+        except Exception as e:
+            messagebox.showerror("IGV Launch Error", f"Error launching IGV: {e}")
+
+if __name__ == "__main__":
     root = tk.Tk()
     app = PipelineGUI(root)
     root.mainloop()
