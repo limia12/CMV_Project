@@ -1,75 +1,61 @@
 #!/bin/bash
 
-# Usage:
-# trim_and_qc.sh <input_dir> <quality_threshold> <num_cores>
+# Usage: filtering.sh <input_dir> <output_dir> <quality_threshold> <num_cores>
 
-# Check if exactly three arguments are provided
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <input_dir> <quality_threshold> <num_cores>"
-    exit 1
-fi
-
-# Assign input arguments to meaningful variable names
-input_dir="$1"             # Directory with raw FASTQ files
-quality_threshold="$2"     # Quality threshold for trimming (e.g., 20)
-num_cores="$3"             # Number of CPU cores to use with GNU Parallel
-
-# Check that the input directory exists
-if [ ! -d "$input_dir" ]; then
-  echo "Error: The directory $input_dir does not exist."
+# Check for correct number of arguments
+if [ "$#" -ne 4 ]; then
+  echo "Usage: $0 <input_dir> <output_dir> <quality_threshold> <num_cores>"
   exit 1
 fi
 
-# Define output directories relative to input directory
-filtered_dir="$input_dir/filtered_reads"     # Where trimmed FASTQs will be saved
-fastqc_dir="$input_dir/fastqc_results"       # Where FastQC results will be saved
+input_dir="$1"
+output_dir="$2"
+quality_threshold="$3"
+num_cores="$4"
 
-# If filtered_reads dir already exists, warn and delete it to avoid mixing results
-if [ -d "$filtered_dir" ]; then
-  echo "Warning: $filtered_dir already exists. Existing files will be replaced."
-  rm -rf "$filtered_dir"
+# Validate input directory
+if [ ! -d "$input_dir" ]; then
+  echo "Error: Input directory '$input_dir' does not exist."
+  exit 1
 fi
-mkdir -p "$filtered_dir"   # Create new filtered_reads directory
 
-# If fastqc_results dir already exists, warn and delete it to avoid conflicts
-if [ -d "$fastqc_dir" ]; then
-  echo "Warning: $fastqc_dir already exists. Existing files will be replaced."
-  rm -rf "$fastqc_dir"
-fi
-mkdir -p "$fastqc_dir"     # Create new fastqc_results directory
+# Prepare output directories
+filtered_dir="$output_dir/filtered_reads"
+fastqc_dir="$output_dir/fastqc_results"
 
-# Notify user that trimming is starting
+echo "Setting up directories..."
+
+mkdir -p "$filtered_dir"
+mkdir -p "$fastqc_dir"
+
+# Clear old contents if directories exist
+rm -rf "$filtered_dir"/*
+rm -rf "$fastqc_dir"/*
+
 echo "Starting paired-end trimming using Trim Galore..."
+echo "Quality threshold: $quality_threshold | Cores: $num_cores"
 
-# Export variables so they’re visible to each GNU parallel job
 export quality_threshold filtered_dir
 
-# For each *_R1.fastq file found:
-# - Determine corresponding *_R2.fastq file
-# - Extract sample base name
-# - Run trim_galore with paired-end mode on that pair
-# - Rename the trimmed output files to standard _R1.fastq / _R2.fastq naming
-find "$input_dir" -name "*_R1.fastq" | parallel -j $num_cores '
-  r1={};  # Save current R1 filename
-  r2=$(echo {} | sed "s/_R1.fastq/_R2.fastq/");  # Infer matching R2 file
-  base=$(basename {} _R1.fastq);  # Extract sample ID from filename
+# Trim reads in parallel
+find "$input_dir" -name "*_R1.fastq" | parallel -j "$num_cores" '
+  r1={};
+  r2=$(echo "$r1" | sed "s/_R1.fastq/_R2.fastq/");
+  base=$(basename "$r1" _R1.fastq);
 
-  # Run Trim Galore with quality trimming and paired-end mode
-  trim_galore --quality $quality_threshold --paired --cores 1 \
-    --output_dir "$filtered_dir" "$r1" "$r2";
+  echo "Processing $base..."
 
-  # Rename the output back to the expected _R1/_R2.fastq names
-  mv "$filtered_dir/${base}_R1_val_1.fq" "$filtered_dir/${base}_R1.fastq";
-  mv "$filtered_dir/${base}_R2_val_2.fq" "$filtered_dir/${base}_R2.fastq";
+  trim_galore --quality "$quality_threshold" --paired --cores 1 --output_dir "$filtered_dir" "$r1" "$r2"
+
+  mv "$filtered_dir/${base}_R1_val_1.fq" "$filtered_dir/${base}_R1.fastq"
+  mv "$filtered_dir/${base}_R2_val_2.fq" "$filtered_dir/${base}_R2.fastq"
 '
 
-# Let user know trimming is complete and FastQC is starting
-echo "Trimming complete. Starting FastQC analysis."
+echo "Trimming complete. Starting FastQC..."
 
-# Run FastQC on all trimmed FASTQ files using GNU Parallel
-# One thread per job, results go into fastqc_results directory
-find "$filtered_dir" -name "*.fastq" | parallel -j $num_cores fastqc -t 1 --outdir "$fastqc_dir" {}
+# Run FastQC
+find "$filtered_dir" -name "*.fastq" | parallel -j "$num_cores" fastqc -t 1 --outdir "$fastqc_dir" {}
 
-# Final messages to confirm success and where outputs are saved
-echo "FastQC analysis complete. Results saved in $fastqc_dir."
-echo "Filtered reads saved in $filtered_dir."
+echo "FastQC complete."
+echo "Filtered reads saved in: $filtered_dir"
+echo "FastQC results saved in: $fastqc_dir"
