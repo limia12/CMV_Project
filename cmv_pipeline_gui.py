@@ -1,9 +1,20 @@
 import os
 import subprocess
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 import webbrowser
-import threading
+import pandas as pd
+import glob
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive Agg backend for Matplotlib (no GUI)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from extract_cmv_bam_metrics import run_bam_metrics  # Import the function you need for BAM metrics
+from summarize_blast_hits import summarize_blast_hits  # Import the summarize_blast_hits function
+import generate_final_report  # Import the final report script
 
 class CollapsibleStep(tk.Frame):
     def __init__(self, parent, step_name, labels, browse_types=None, *args, **kwargs):
@@ -78,7 +89,7 @@ class PipelineGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CMV Bioinformatics Pipeline GUI")
-        self.geometry("850x700")
+        self.geometry("850x750")
 
         self.steps_info = {
             "split_interleaved": ["Input", "Output", "Number of Cores"],
@@ -88,23 +99,30 @@ class PipelineGUI(tk.Tk):
             "unaligned_reads": ["Input", "Output", "Number of Cores"],
             "index_cmv": ["Input", "Output", "Number of Cores"],
             "align_cmv": ["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"],
-            "blast": ["Forward FASTQ", "Reverse FASTQ", "BLAST DB Directory", "Number of Threads", "Output Directory"]
+            "extract_cmv_metrics": ["BAM Directory", "Output Directory"],
+            "blast_summary": ["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"],
+            "summarize_blast_hits": ["BLAST TSV Directory", "Output Directory"],
+            "generate_final_report": ["CSV Directory", "FastQC Directory", "BLAST Directory", "Output Directory"]  # Updated step
         }
 
         self.browse_types = {
             "quality threshold": "text",
             "number of cores": "text",
-            "number of threads": "text",
             "reference genome": "dir",
             "forward fastq": "file",
             "reverse fastq": "file",
             "blast db directory": "dir",
             "output directory": "dir",
-            "fastq dir": "dir"
+            "fastq dir": "dir",
+            "bam directory": "dir",
+            "blast tsv directory": "dir",
+            "csv directory": "dir",
         }
 
         self.steps = {}
+        self.build_ui()
 
+    def build_ui(self):
         main_frame = tk.Frame(self)
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -138,7 +156,7 @@ class PipelineGUI(tk.Tk):
         self.run_button.grid(row=0, column=0, padx=5)
 
         tk.Button(btn_frame, text="Open FastQC Reports", command=self.open_fastqc_reports,
-                  bg="#2196F3", fg="white", font=("Arial", 11), width=15).grid(row=0, column=1, padx=5)
+                  bg="#2196F3", fg="white", font=("Arial", 11), width=18).grid(row=0, column=1, padx=5)
 
         tk.Button(btn_frame, text="Open IGV", command=self.launch_igv,
                   bg="#9C27B0", fg="white", font=("Arial", 11), width=15).grid(row=0, column=2, padx=5)
@@ -152,9 +170,6 @@ class PipelineGUI(tk.Tk):
         self.log_text.after(0, lambda: self.log_text.see(tk.END))
 
     def run_script_live(self, script_name, *args):
-        if "alignment_bwa-mem.sh" in script_name and len(args) == 4:
-            args = list(args[:3]) + ["--threads", args[3]]
-
         cmd = ["bash", script_name] + list(args)
         self.add_log("Running: " + " ".join(cmd))
 
@@ -207,9 +222,44 @@ class PipelineGUI(tk.Tk):
                 elif name == "align_cmv":
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
                     success = self.run_script_live("alignment_bwa-mem.sh", vals["FASTQ Dir"], vals["Reference Genome"], vals["Output"], vals["Number of Cores"])
-                elif name == "blast":
-                    check_fields(["Forward FASTQ", "Reverse FASTQ", "BLAST DB Directory", "Number of Threads", "Output Directory"])
-                    success = self.run_script_live("BLAST.sh", vals["Forward FASTQ"], vals["Reverse FASTQ"], vals["BLAST DB Directory"], vals["Number of Threads"], vals["Output Directory"])
+                elif name == "extract_cmv_metrics":
+                    check_fields(["BAM Directory", "Output Directory"])
+                    success = run_bam_metrics(vals["BAM Directory"], vals["Output Directory"], log_func=self.add_log)
+                elif name == "blast_summary":
+                    check_fields(["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"])
+                    success = self.run_script_live("02_blast_cmv_summary.sh", vals["FASTQ Directory"], vals["BLAST DB Directory"], vals["Output Directory"], vals["Threads"])
+                elif name == "summarize_blast_hits":
+                    check_fields(["BLAST TSV Directory", "Output Directory"])  # Updated check
+                    blast_tsv_dir = vals["BLAST TSV Directory"]
+                    output_dir = vals["Output Directory"]
+                    summarize_blast_hits(blast_tsv_dir, output_dir)  # Run the new script function
+                    success = True
+                elif name == "generate_final_report":
+                    check_fields(["CSV Directory", "FastQC Directory", "BLAST Directory", "Output Directory"])
+                    csv_dir = vals["CSV Directory"]
+                    fastqc_dir = vals["FastQC Directory"]
+                    blast_dir = vals["BLAST Directory"]
+                    output_dir = vals["Output Directory"]
+
+                    # Find and load the required CSV files from the directory using patterns
+                    gene_coverage_csv = glob.glob(os.path.join(csv_dir, "*_sorted_gene.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_sorted_gene.csv")) else None
+                    blast_summary_csv = glob.glob(os.path.join(csv_dir, "*_blast_top5.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_blast_top5.csv")) else None
+                    bam_metrics_csv = glob.glob(os.path.join(csv_dir, "*_summary.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_summary.csv")) else None
+                    per_base_depth_csv = glob.glob(os.path.join(csv_dir, "*_per_base.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_per_base.csv")) else None
+
+                    # Check if all files are found
+                    if not all([gene_coverage_csv, blast_summary_csv, bam_metrics_csv, per_base_depth_csv]):
+                        raise ValueError("One or more required CSV files are missing in the selected directory.")
+
+                    # Read the CSV files
+                    gene_df = pd.read_csv(gene_coverage_csv)
+                    blast_df = pd.read_csv(blast_summary_csv)
+                    bam_df = pd.read_csv(bam_metrics_csv)
+                    per_base_df = pd.read_csv(per_base_depth_csv)
+
+                    # Generate the final report
+                    generate_final_report.generate_final_cmv_report(gene_df, blast_df, bam_df, per_base_df, fastqc_dir, blast_dir, output_dir)
+                    success = True
 
                 if not success:
                     self.add_log(f"Step {name} failed. Stopping pipeline.")
@@ -242,14 +292,17 @@ class PipelineGUI(tk.Tk):
                 messagebox.showerror("Error", f"Cannot find summary.html in {fastqc_dir}")
 
     def launch_igv(self):
-        igv_path = filedialog.askopenfilename(title="Select IGV Executable")
-        if igv_path and os.path.isfile(igv_path):
-            try:
-                subprocess.Popen([igv_path])
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to launch IGV: {e}")
-        else:
-            messagebox.showerror("Error", "Invalid IGV executable path.")
+        try:
+            bam_file = filedialog.askopenfilename(title="Select BAM file", filetypes=[("BAM files", "*.bam")])
+            if not bam_file:
+                return
+            ref_file = filedialog.askopenfilename(title="Select Reference Genome", filetypes=[("FASTA files", "*.fasta *.fa *.fna"), ("All files", "*.*")])
+            if not ref_file:
+                return
+            subprocess.Popen(["igv", "-g", ref_file, bam_file])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch IGV: {e}")
+
 
 if __name__ == "__main__":
     app = PipelineGUI()
