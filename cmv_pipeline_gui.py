@@ -11,6 +11,7 @@ matplotlib.use('Agg')  # Use non-interactive Agg backend for Matplotlib (no GUI)
 
 import matplotlib.pyplot as plt
 import seaborn as sns
+import shlex  # added for safe command logging
 
 from extract_cmv_bam_metrics import run_bam_metrics  # Import the function you need for BAM metrics
 from summarize_blast_hits import summarize_blast_hits  # Import the summarize_blast_hits function
@@ -170,17 +171,24 @@ class PipelineGUI(tk.Tk):
         self.log_text.after(0, lambda: self.log_text.see(tk.END))
 
     def run_script_live(self, script_name, *args):
+        # UPDATED: merge stderr into stdout and force line-buffering to avoid pipe deadlocks
         cmd = ["bash", script_name] + list(args)
-        self.add_log("Running: " + " ".join(cmd))
+        wrapped = ["stdbuf", "-oL", "-eL"] + cmd
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.add_log("Running: " + " ".join(shlex.quote(c) for c in wrapped))
+
+        process = subprocess.Popen(
+            wrapped,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into stdout
+            text=True,
+            bufsize=1,                  # line-buffered in Python
+            universal_newlines=True
+        )
         for line in process.stdout:
             self.add_log(line.rstrip())
-        err = process.stderr.read()
-        if err:
-            self.add_log(err)
-        process.wait()
-        return process.returncode == 0
+        rc = process.wait()
+        return rc == 0
 
     def run_pipeline_worker(self):
         self.run_button.config(state="disabled")
@@ -212,7 +220,14 @@ class PipelineGUI(tk.Tk):
                     success = self.run_script_live("index_human.sh", vals["Input"], vals["Output"], vals["Number of Cores"])
                 elif name == "align_human":
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
-                    success = self.run_script_live("alignment_bwa-mem.sh", vals["FASTQ Dir"], vals["Reference Genome"], vals["Output"], vals["Number of Cores"])
+                    # UPDATED: pass threads flag correctly
+                    success = self.run_script_live(
+                        "alignment_bwa-mem.sh",
+                        vals["FASTQ Dir"],
+                        vals["Reference Genome"],
+                        vals["Output"],
+                        "--threads", vals["Number of Cores"]
+                    )
                 elif name == "unaligned_reads":
                     check_fields(["Input", "Output", "Number of Cores"])
                     success = self.run_script_live("unaligned_reads.sh", vals["Input"], vals["Output"], vals["Number of Cores"])
@@ -221,7 +236,14 @@ class PipelineGUI(tk.Tk):
                     success = self.run_script_live("index_cmv.sh", vals["Input"], vals["Output"], vals["Number of Cores"])
                 elif name == "align_cmv":
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
-                    success = self.run_script_live("alignment_bwa-mem.sh", vals["FASTQ Dir"], vals["Reference Genome"], vals["Output"], vals["Number of Cores"])
+                    # UPDATED: pass threads flag correctly
+                    success = self.run_script_live(
+                        "alignment_bwa-mem.sh",
+                        vals["FASTQ Dir"],
+                        vals["Reference Genome"],
+                        vals["Output"],
+                        "--threads", vals["Number of Cores"]
+                    )
                 elif name == "extract_cmv_metrics":
                     check_fields(["BAM Directory", "Output Directory"])
                     success = run_bam_metrics(vals["BAM Directory"], vals["Output Directory"], log_func=self.add_log)
