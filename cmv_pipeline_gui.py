@@ -7,15 +7,15 @@ import webbrowser
 import pandas as pd
 import glob
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive Agg backend for Matplotlib (no GUI)
+matplotlib.use('Agg')  # headless backend
 
 import matplotlib.pyplot as plt
 import seaborn as sns
-import shlex  # added for safe command logging
+import shlex
 
-from extract_cmv_bam_metrics import run_bam_metrics  # Import the function you need for BAM metrics
-from summarize_blast_hits import summarize_blast_hits  # Import the summarize_blast_hits function
-import generate_final_report  # Import the final report script
+from extract_cmv_bam_metrics import run_bam_metrics  # unchanged
+from summarize_blast_hits import summarize_blast_hits  # unchanged
+import generate_final_report  # NEW: updated to accept directories + BAM stats dir
 
 class CollapsibleStep(tk.Frame):
     def __init__(self, parent, step_name, labels, browse_types=None, *args, **kwargs):
@@ -35,8 +35,8 @@ class CollapsibleStep(tk.Frame):
 
         for label in labels:
             row = tk.Frame(self.content_frame)
-            lbl = tk.Label(row, text=f"{label}:", width=20, anchor='e')
-            ent = tk.Entry(row, width=50)
+            lbl = tk.Label(row, text=f"{label}:", width=22, anchor='e')
+            ent = tk.Entry(row, width=54)
             browse_type = self.browse_types.get(label.lower(), 'dir')
             if browse_type != 'text':
                 btn = tk.Button(row, text="Browse", command=lambda l=label: self.browse_path(l))
@@ -72,9 +72,9 @@ class CollapsibleStep(tk.Frame):
             elif 'blast db directory' in lbl_lower:
                 path = filedialog.askdirectory(title="Select BLAST DB Directory")
             elif 'csv' in lbl_lower:
-                path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-            elif 'bed' in lbl_lower:
-                path = filedialog.askopenfilename(filetypes=[("BED files", "*.bed"), ("All files", "*.*")])
+                path = filedialog.askdirectory(title=f"Select {label}")
+            elif 'bam stats' in lbl_lower:
+                path = filedialog.askdirectory(title="Select BAM_Stats Directory (with *_flagstat.txt / *_stats.txt)")
             else:
                 path = filedialog.askdirectory(title=f"Select {label}")
 
@@ -90,8 +90,9 @@ class PipelineGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CMV Bioinformatics Pipeline GUI")
-        self.geometry("850x750")
+        self.geometry("900x780")
 
+        # NEW: Add "BAM Stats Directory" to the final report step
         self.steps_info = {
             "split_interleaved": ["Input", "Output", "Number of Cores"],
             "filtering": ["Input", "Output", "Quality Threshold", "Number of Cores"],
@@ -103,7 +104,8 @@ class PipelineGUI(tk.Tk):
             "extract_cmv_metrics": ["BAM Directory", "Output Directory"],
             "blast_summary": ["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"],
             "summarize_blast_hits": ["BLAST TSV Directory", "Output Directory"],
-            "generate_final_report": ["CSV Directory", "FastQC Directory", "BLAST Directory", "Output Directory"]  # Updated step
+            # UPDATED: add BAM Stats Directory; we now pass directories to the report generator
+            "generate_final_report": ["CSV Directory", "FastQC Directory", "BLAST Directory", "BAM Stats Directory", "Output Directory"]
         }
 
         self.browse_types = {
@@ -116,6 +118,7 @@ class PipelineGUI(tk.Tk):
             "output directory": "dir",
             "fastq dir": "dir",
             "bam directory": "dir",
+            "bam stats directory": "dir",
             "blast tsv directory": "dir",
             "csv directory": "dir",
         }
@@ -171,18 +174,15 @@ class PipelineGUI(tk.Tk):
         self.log_text.after(0, lambda: self.log_text.see(tk.END))
 
     def run_script_live(self, script_name, *args):
-        # UPDATED: merge stderr into stdout and force line-buffering to avoid pipe deadlocks
         cmd = ["bash", script_name] + list(args)
         wrapped = ["stdbuf", "-oL", "-eL"] + cmd
-
         self.add_log("Running: " + " ".join(shlex.quote(c) for c in wrapped))
-
         process = subprocess.Popen(
             wrapped,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout
+            stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,                  # line-buffered in Python
+            bufsize=1,
             universal_newlines=True
         )
         for line in process.stdout:
@@ -220,7 +220,6 @@ class PipelineGUI(tk.Tk):
                     success = self.run_script_live("index_human.sh", vals["Input"], vals["Output"], vals["Number of Cores"])
                 elif name == "align_human":
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
-                    # UPDATED: pass threads flag correctly
                     success = self.run_script_live(
                         "alignment_bwa-mem.sh",
                         vals["FASTQ Dir"],
@@ -236,7 +235,6 @@ class PipelineGUI(tk.Tk):
                     success = self.run_script_live("index_cmv.sh", vals["Input"], vals["Output"], vals["Number of Cores"])
                 elif name == "align_cmv":
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
-                    # UPDATED: pass threads flag correctly
                     success = self.run_script_live(
                         "alignment_bwa-mem.sh",
                         vals["FASTQ Dir"],
@@ -251,36 +249,26 @@ class PipelineGUI(tk.Tk):
                     check_fields(["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"])
                     success = self.run_script_live("02_blast_cmv_summary.sh", vals["FASTQ Directory"], vals["BLAST DB Directory"], vals["Output Directory"], vals["Threads"])
                 elif name == "summarize_blast_hits":
-                    check_fields(["BLAST TSV Directory", "Output Directory"])  # Updated check
-                    blast_tsv_dir = vals["BLAST TSV Directory"]
-                    output_dir = vals["Output Directory"]
-                    summarize_blast_hits(blast_tsv_dir, output_dir)  # Run the new script function
+                    check_fields(["BLAST TSV Directory", "Output Directory"])
+                    summarize_blast_hits(vals["BLAST TSV Directory"], vals["Output Directory"])
                     success = True
                 elif name == "generate_final_report":
-                    check_fields(["CSV Directory", "FastQC Directory", "BLAST Directory", "Output Directory"])
+                    check_fields(["CSV Directory", "FastQC Directory", "BLAST Directory", "BAM Stats Directory", "Output Directory"])
+
                     csv_dir = vals["CSV Directory"]
                     fastqc_dir = vals["FastQC Directory"]
                     blast_dir = vals["BLAST Directory"]
+                    bam_stats_dir = vals["BAM Stats Directory"]
                     output_dir = vals["Output Directory"]
 
-                    # Find and load the required CSV files from the directory using patterns
-                    gene_coverage_csv = glob.glob(os.path.join(csv_dir, "*_sorted_gene.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_sorted_gene.csv")) else None
-                    blast_summary_csv = glob.glob(os.path.join(csv_dir, "*_blast_top5.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_blast_top5.csv")) else None
-                    bam_metrics_csv = glob.glob(os.path.join(csv_dir, "*_summary.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_summary.csv")) else None
-                    per_base_depth_csv = glob.glob(os.path.join(csv_dir, "*_per_base.csv"))[0] if glob.glob(os.path.join(csv_dir, "*_per_base.csv")) else None
-
-                    # Check if all files are found
-                    if not all([gene_coverage_csv, blast_summary_csv, bam_metrics_csv, per_base_depth_csv]):
-                        raise ValueError("One or more required CSV files are missing in the selected directory.")
-
-                    # Read the CSV files
-                    gene_df = pd.read_csv(gene_coverage_csv)
-                    blast_df = pd.read_csv(blast_summary_csv)
-                    bam_df = pd.read_csv(bam_metrics_csv)
-                    per_base_df = pd.read_csv(per_base_depth_csv)
-
-                    # Generate the final report
-                    generate_final_report.generate_final_cmv_report(gene_df, blast_df, bam_df, per_base_df, fastqc_dir, blast_dir, output_dir)
+                    # We now pass directories; the report aggregates ALL samples.
+                    generate_final_report.generate_final_cmv_report(
+                        csv_dir=csv_dir,
+                        fastqc_dir=fastqc_dir,
+                        blast_dir=blast_dir,
+                        out_dir=output_dir,
+                        bam_stats_dir=bam_stats_dir
+                    )
                     success = True
 
                 if not success:
