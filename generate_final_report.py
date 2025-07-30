@@ -229,28 +229,79 @@ def plot_blast_identity_heatmaps(blast_dir, out_dir, min_identity=85, bin_size=1
         region_paths.append((region["name"], f"blast_regions/{region['name']}_blast_heatmap.png"))
     return full_path, region_paths
 
-def plot_per_base_depth_heatmaps(per_base_df, out_dir):
+def plot_per_base_depth_heatmaps(per_base_df, out_dir, bin_size=None):
+    """
+    Plot per-base coverage heatmaps per conserved region using ABSOLUTE genome positions.
+    If bin_size is provided (e.g., 50 or 100), depths are averaged within each genomic bin
+    to reduce the number of columns and improve readability.
+    """
+    import numpy as np
     heatmap_dir = os.path.join(out_dir, "per_base_heatmaps")
     os.makedirs(heatmap_dir, exist_ok=True)
+
+    # Map region names to absolute [start, end]
     region_map = {r["name"]: (r["start"], r["end"]) for r in CONSERVE_REGIONS}
 
     for gene, (start, end) in region_map.items():
-        data = per_base_df[(per_base_df["gene"] == gene) &
-                           (per_base_df["position"] >= start) &
-                           (per_base_df["position"] <= end)].copy()
+        # Filter to this region ONLY (absolute genome coordinates)
+        data = per_base_df[
+            (per_base_df["gene"] == gene) &
+            (per_base_df["position"] >= start) &
+            (per_base_df["position"] <= end)
+        ].copy()
+
         if data.empty:
             continue
-        data["relative_position"] = data["position"] - start + 1
-        pivot = data.pivot(index="sample", columns="relative_position", values="depth")
+
+        # Optional binning (averaging depth within bins of size bin_size)
+        if bin_size and bin_size > 1:
+            # left-aligned bins like 78100, 78150, 78200...
+            data["bin_pos"] = (data["position"] // bin_size) * bin_size
+            pivot = (
+                data.groupby(["sample", "bin_pos"])["depth"]
+                    .mean()
+                    .unstack(fill_value=0)
+                    .sort_index(axis=1)
+            )
+            x_label = f"Genomic Position (binned, {bin_size} bp)"
+        else:
+            pivot = (
+                data.pivot(index="sample", columns="position", values="depth")
+                    .fillna(0)
+                    .sort_index(axis=1)
+            )
+            x_label = "Genomic Position (Merlin reference)"
+
+        # Make the heatmap
         plt.figure(figsize=(18, 6))
-        sns.heatmap(pivot, cmap="viridis", cbar_kws={"label": "Depth"}, vmin=0, vmax=200)
-        plt.title(f"Per-base Depth: {gene}")
-        plt.xlabel("Position (relative to gene start)")
+        sns.heatmap(
+            pivot,
+            cmap="viridis",
+            cbar_kws={"label": "Depth"},
+            vmin=0,
+            vmax=max(200, np.nanpercentile(pivot.to_numpy().flatten(), 99))  # adaptive ceiling
+        )
+        plt.title(f"Per-base Depth (Absolute Coordinates): {gene}  [{start}-{end}]")
+        plt.xlabel(x_label)
         plt.ylabel("Sample")
+
+        # Thin x-ticks for readability
+        ax = plt.gca()
+        col_vals = pivot.columns.to_numpy()
+        if col_vals.size > 25:
+            # aim for ~25 ticks
+            step = max(1, col_vals.size // 25)
+            tick_idx = np.arange(0, col_vals.size, step)
+            ax.set_xticks(tick_idx + 0.5)  # center on cells
+            ax.set_xticklabels([int(col_vals[i]) for i in tick_idx], rotation=45, ha="right")
+        else:
+            ax.set_xticklabels([int(x) for x in col_vals], rotation=45, ha="right")
+
         out_path = os.path.join(heatmap_dir, f"{gene}_per_base_depth.png")
         plt.tight_layout()
         plt.savefig(out_path)
         plt.close()
+
 
 def plot_depth_across_genome(per_base_df, out_dir):
     coverage_dir = os.path.join(out_dir, "genome_coverage")
