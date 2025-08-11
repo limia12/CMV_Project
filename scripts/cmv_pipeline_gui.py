@@ -1,21 +1,19 @@
 import os
+import signal
 import subprocess
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 import webbrowser
-import pandas as pd
 import glob
 import matplotlib
 matplotlib.use('Agg')  # headless backend
-
-import matplotlib.pyplot as plt
-import seaborn as sns
 import shlex
 
 from extract_cmv_bam_metrics import run_bam_metrics  # unchanged
 from summarize_blast_hits import summarize_blast_hits  # unchanged
-import generate_final_report  # NEW: updated to accept directories + BAM stats dir
+# NOTE: removed: import generate_final_report
 
 class CollapsibleStep(tk.Frame):
     def __init__(self, parent, step_name, labels, browse_types=None, *args, **kwargs):
@@ -25,9 +23,13 @@ class CollapsibleStep(tk.Frame):
         self.browse_types = browse_types or {}
 
         self.var = tk.BooleanVar()
-        self.checkbox = tk.Checkbutton(self, text=step_name.replace('_', ' ').title(),
-                                       variable=self.var, command=self.toggle,
-                                       font=("Arial", 11, "bold"))
+        self.checkbox = tk.Checkbutton(
+            self,
+            text=step_name.replace('_', ' ').title(),
+            variable=self.var,
+            command=self.toggle,
+            font=("Arial", 11, "bold")
+        )
         self.checkbox.pack(anchor='w', pady=2)
 
         self.content_frame = tk.Frame(self)
@@ -58,23 +60,28 @@ class CollapsibleStep(tk.Frame):
         bt = self.browse_types.get(label.lower(), 'dir')
         lbl_lower = label.lower()
 
+        path = ""
         if bt == 'dir':
             path = filedialog.askdirectory(title=f"Select {label}")
         elif bt == 'file':
             path = filedialog.askopenfilename(title=f"Select {label}")
         else:
             if 'reference genome' in lbl_lower:
-                path = filedialog.askopenfilename(filetypes=[("FASTA files", "*.fa *.fasta *.fna"), ("All files", "*.*")])
+                path = filedialog.askopenfilename(filetypes=[
+                    ("FASTA files", "*.fa *.fasta *.fna"), ("All files", "*.*")
+                ], title=f"Select {label}")
             elif 'fastq' in lbl_lower and ('dir' in lbl_lower or 'directory' in lbl_lower):
                 path = filedialog.askdirectory(title=f"Select {label}")
             elif 'fastq' in lbl_lower:
-                path = filedialog.askopenfilename(filetypes=[("FASTQ files", "*.fastq *.fq *.fastq.gz *.fq.gz"), ("All files", "*.*")])
+                path = filedialog.askopenfilename(filetypes=[
+                    ("FASTQ files", "*.fastq *.fq *.fastq.gz *.fq.gz"), ("All files", "*.*")
+                ], title=f"Select {label}")
             elif 'blast db directory' in lbl_lower:
                 path = filedialog.askdirectory(title="Select BLAST DB Directory")
             elif 'csv' in lbl_lower:
                 path = filedialog.askdirectory(title=f"Select {label}")
             elif 'bam stats' in lbl_lower:
-                path = filedialog.askdirectory(title="Select BAM_Stats Directory (with *_flagstat.txt / *_stats.txt)")
+                path = filedialog.askdirectory(title="Select BAM Stats Directory (with *_flagstat.txt / *_stats.txt)")
             else:
                 path = filedialog.askdirectory(title=f"Select {label}")
 
@@ -91,8 +98,9 @@ class PipelineGUI(tk.Tk):
         super().__init__()
         self.title("CMV Bioinformatics Pipeline GUI")
         self.geometry("900x780")
+        self._streamlit_proc = None
 
-        # NEW: Add "BAM Stats Directory" to the final report step
+        # Replace "generate_final_report" with "interactive_report_streamlit"
         self.steps_info = {
             "split_interleaved": ["Input", "Output", "Number of Cores"],
             "filtering": ["Input", "Output", "Quality Threshold", "Number of Cores"],
@@ -104,8 +112,8 @@ class PipelineGUI(tk.Tk):
             "extract_cmv_metrics": ["BAM Directory", "Output Directory"],
             "blast_summary": ["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"],
             "summarize_blast_hits": ["BLAST TSV Directory", "Output Directory"],
-            # UPDATED: add BAM Stats Directory; we now pass directories to the report generator
-            "generate_final_report": ["CSV Directory", "FastQC Directory", "BLAST Directory", "BAM Stats Directory", "Output Directory"]
+            # New final step: just run Streamlit app and open it
+            "interactive_report_streamlit": ["Path to app.py", "Port (e.g., 8501)"]
         }
 
         self.browse_types = {
@@ -121,10 +129,13 @@ class PipelineGUI(tk.Tk):
             "bam stats directory": "dir",
             "blast tsv directory": "dir",
             "csv directory": "dir",
+            "path to app.py": "file",
+            "port (e.g., 8501)": "text",
         }
 
         self.steps = {}
         self.build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self):
         main_frame = tk.Frame(self)
@@ -134,7 +145,10 @@ class PipelineGUI(tk.Tk):
         scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
         self.scrollable_frame = tk.Frame(canvas)
 
-        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
         canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -143,6 +157,9 @@ class PipelineGUI(tk.Tk):
 
         for step_name, fields in self.steps_info.items():
             step = CollapsibleStep(self.scrollable_frame, step_name, fields, self.browse_types)
+            # sensible defaults for Streamlit step
+            if step_name == "interactive_report_streamlit":
+                step.entries["Port (e.g., 8501)"].insert(0, "8501")
             step.pack(fill='x', pady=5)
             self.steps[step_name] = step
 
@@ -155,15 +172,36 @@ class PipelineGUI(tk.Tk):
         btn_frame = tk.Frame(control_frame)
         btn_frame.pack(pady=5)
 
-        self.run_button = tk.Button(btn_frame, text="Run Pipeline", command=self.start_pipeline,
-                                    bg="#4CAF50", fg="white", font=("Arial", 11), width=15)
+        self.run_button = tk.Button(
+            btn_frame,
+            text="Run Pipeline",
+            command=self.start_pipeline,
+            bg="#4CAF50",
+            fg="white",
+            font=("Arial", 11),
+            width=15
+        )
         self.run_button.grid(row=0, column=0, padx=5)
 
-        tk.Button(btn_frame, text="Open FastQC Reports", command=self.open_fastqc_reports,
-                  bg="#2196F3", fg="white", font=("Arial", 11), width=18).grid(row=0, column=1, padx=5)
+        tk.Button(
+            btn_frame,
+            text="Open FastQC Reports",
+            command=self.open_fastqc_reports,
+            bg="#2196F3",
+            fg="white",
+            font=("Arial", 11),
+            width=18
+        ).grid(row=0, column=1, padx=5)
 
-        tk.Button(btn_frame, text="Open IGV", command=self.launch_igv,
-                  bg="#9C27B0", fg="white", font=("Arial", 11), width=15).grid(row=0, column=2, padx=5)
+        tk.Button(
+            btn_frame,
+            text="Open IGV",
+            command=self.launch_igv,
+            bg="#9C27B0",
+            fg="white",
+            font=("Arial", 11),
+            width=15
+        ).grid(row=0, column=2, padx=5)
 
         self.log_text = scrolledtext.ScrolledText(self, height=10, font=("Arial", 10))
         self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
@@ -177,18 +215,83 @@ class PipelineGUI(tk.Tk):
         cmd = ["bash", script_name] + list(args)
         wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.add_log("Running: " + " ".join(shlex.quote(c) for c in wrapped))
-        process = subprocess.Popen(
-            wrapped,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
+        try:
+            process = subprocess.Popen(
+                wrapped,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+        except Exception as e:
+            self.add_log(f"❌ Failed to start process {script_name}: {e}")
+            return False
+
         for line in process.stdout:
             self.add_log(line.rstrip())
         rc = process.wait()
         return rc == 0
+
+    def _launch_streamlit(self, app_path: str, port: int) -> bool:
+        # If already running, do nothing
+        if self._streamlit_proc and self._streamlit_proc.poll() is None:
+            self.add_log("ℹ️ Streamlit already running.")
+            return True
+
+        if not os.path.isfile(app_path):
+            self.add_log(f"❌ app.py not found at {app_path}")
+            return False
+
+        cmd = [
+            "streamlit", "run", app_path,
+            "--server.headless", "true",
+            "--server.port", str(port),
+        ]
+        self.add_log("Starting Streamlit: " + " ".join(shlex.quote(c) for c in cmd))
+
+        try:
+            # Start Streamlit and stream logs into the GUI
+            self._streamlit_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                universal_newlines=True
+            )
+        except FileNotFoundError:
+            self.add_log("❌ Could not find the 'streamlit' executable. Is it installed in this environment?")
+            return False
+        except Exception as e:
+            self.add_log(f"❌ Failed to start Streamlit: {e}")
+            return False
+
+        # Log stream in background
+        def _pump_logs():
+            try:
+                for line in self._streamlit_proc.stdout:
+                    self.add_log(line.rstrip())
+            except Exception:
+                pass
+
+        threading.Thread(target=_pump_logs, daemon=True).start()
+
+        # Give Streamlit a moment to boot, then open browser
+        def _open_when_ready():
+            # Simple retry loop to open browser
+            url = f"http://localhost:{port}"
+            for _ in range(20):
+                time.sleep(0.5)
+                # Try to open once; if successful, exit loop
+                try:
+                    webbrowser.open_new_tab(url)
+                    break
+                except Exception:
+                    continue
+            self.add_log(f"🌐 Interactive report available at: {url}")
+
+        threading.Thread(target=_open_when_ready, daemon=True).start()
+        return True
 
     def run_pipeline_worker(self):
         self.run_button.config(state="disabled")
@@ -222,9 +325,7 @@ class PipelineGUI(tk.Tk):
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
                     success = self.run_script_live(
                         "alignment_bwa-mem.sh",
-                        vals["FASTQ Dir"],
-                        vals["Reference Genome"],
-                        vals["Output"],
+                        vals["FASTQ Dir"], vals["Reference Genome"], vals["Output"],
                         "--threads", vals["Number of Cores"]
                     )
                 elif name == "unaligned_reads":
@@ -237,9 +338,7 @@ class PipelineGUI(tk.Tk):
                     check_fields(["FASTQ Dir", "Reference Genome", "Output", "Number of Cores"])
                     success = self.run_script_live(
                         "alignment_bwa-mem.sh",
-                        vals["FASTQ Dir"],
-                        vals["Reference Genome"],
-                        vals["Output"],
+                        vals["FASTQ Dir"], vals["Reference Genome"], vals["Output"],
                         "--threads", vals["Number of Cores"]
                     )
                 elif name == "extract_cmv_metrics":
@@ -252,24 +351,14 @@ class PipelineGUI(tk.Tk):
                     check_fields(["BLAST TSV Directory", "Output Directory"])
                     summarize_blast_hits(vals["BLAST TSV Directory"], vals["Output Directory"])
                     success = True
-                elif name == "generate_final_report":
-                    check_fields(["CSV Directory", "FastQC Directory", "BLAST Directory", "BAM Stats Directory", "Output Directory"])
-
-                    csv_dir = vals["CSV Directory"]
-                    fastqc_dir = vals["FastQC Directory"]
-                    blast_dir = vals["BLAST Directory"]
-                    bam_stats_dir = vals["BAM Stats Directory"]
-                    output_dir = vals["Output Directory"]
-
-                    # We now pass directories; the report aggregates ALL samples.
-                    generate_final_report.generate_final_cmv_report(
-                        csv_dir=csv_dir,
-                        fastqc_dir=fastqc_dir,
-                        blast_dir=blast_dir,
-                        out_dir=output_dir,
-                        bam_stats_dir=bam_stats_dir
-                    )
-                    success = True
+                elif name == "interactive_report_streamlit":
+                    check_fields(["Path to app.py", "Port (e.g., 8501)"])
+                    app_path = vals["Path to app.py"]
+                    try:
+                        port = int(vals["Port (e.g., 8501)"])
+                    except ValueError:
+                        raise ValueError("Port must be an integer, e.g., 8501")
+                    success = self._launch_streamlit(app_path, port)
 
                 if not success:
                     self.add_log(f"Step {name} failed. Stopping pipeline.")
@@ -297,21 +386,39 @@ class PipelineGUI(tk.Tk):
         if fastqc_dir:
             index_path = os.path.join(fastqc_dir, "summary.html")
             if os.path.isfile(index_path):
-                webbrowser.open_new_tab(f"file://{index_path}")
+                webbrowser.open_new_tab(f"file://{os.path.abspath(index_path)}")
             else:
                 messagebox.showerror("Error", f"Cannot find summary.html in {fastqc_dir}")
 
     def launch_igv(self):
         try:
-            bam_file = filedialog.askopenfilename(title="Select BAM file", filetypes=[("BAM files", "*.bam")])
+            bam_file = filedialog.askopenfilename(
+                title="Select BAM file",
+                filetypes=[("BAM files", "*.bam")]
+            )
             if not bam_file:
                 return
-            ref_file = filedialog.askopenfilename(title="Select Reference Genome", filetypes=[("FASTA files", "*.fasta *.fa *.fna"), ("All files", "*.*")])
+            ref_file = filedialog.askopenfilename(
+                title="Select Reference Genome",
+                filetypes=[("FASTA files", "*.fasta *.fa *.fna"), ("All files", "*.*")]
+            )
             if not ref_file:
                 return
             subprocess.Popen(["igv", "-g", ref_file, bam_file])
         except Exception as e:
             messagebox.showerror("Error", f"Failed to launch IGV: {e}")
+
+    def on_close(self):
+        # Cleanly stop Streamlit if it's running
+        try:
+            if self._streamlit_proc and self._streamlit_proc.poll() is None:
+                if os.name == "nt":
+                    self._streamlit_proc.terminate()
+                else:
+                    os.killpg(os.getpgid(self._streamlit_proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+        self.destroy()
 
 
 if __name__ == "__main__":
