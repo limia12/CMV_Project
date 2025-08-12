@@ -14,6 +14,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
+# --- optional: clear Streamlit caches on startup if env flag is set ---
+# Clear Streamlit caches on startup when launched from the GUI
+if os.environ.get("CLEAR_CACHE_ON_START") == "1":
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+
 # ----------------------- Conserved regions -----------------------
 CONSERVE_REGIONS = [
     {"name": "IE1",   "start": 172328, "end": 174090},
@@ -37,6 +47,7 @@ _SUFFIX_PATTERNS = [
     r'(?:_filtered)$',                      # _filtered
     r'(?:\.bam)$',                          # .bam
 ]
+
 def canonical_sample(name: str) -> str:
     s = name
     changed = True
@@ -48,6 +59,7 @@ def canonical_sample(name: str) -> str:
                 s = new
                 changed = True
     return s.rstrip("_-")
+
 
 def add_base_column(df: pd.DataFrame) -> pd.DataFrame:
     if df is not None and not df.empty and "sample" in df.columns:
@@ -72,6 +84,7 @@ def _read_csv_list(files, **read_kwargs) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
+
 
 @st.cache_data(show_spinner=False)
 def load_all(csv_dir: str, blast_dir: str):
@@ -105,6 +118,7 @@ def load_all(csv_dir: str, blast_dir: str):
     blast_top5  = add_base_column(blast_top5)
     blast_hits  = add_base_column(blast_hits)
     return gene_df, per_base_df, bam_df, blast_top5, blast_hits
+
 
 @st.cache_data(show_spinner=False)
 def load_alignment_stats(bam_stats_dir: str) -> pd.DataFrame:
@@ -184,6 +198,89 @@ def load_alignment_stats(bam_stats_dir: str) -> pd.DataFrame:
     flag_df = add_base_column(flag_df)
     return flag_df
 
+
+# ----------------------- NEW: VAF loaders & helpers -----------------------
+@st.cache_data(show_spinner=False)
+def load_vaf_tables(vaf_dir: str) -> pd.DataFrame:
+    """Load LoFreq VAF tables: expects *_vaf.tsv with header CHROM POS REF ALT DP AD_ALT AF."""
+    if not vaf_dir or not os.path.isdir(vaf_dir):
+        return pd.DataFrame()
+    paths = glob.glob(os.path.join(vaf_dir, "*_vaf.tsv"))
+    rows = []
+    for p in paths:
+        try:
+            df = pd.read_csv(p, sep="\t")
+            if df.empty:
+                continue
+            sample = os.path.basename(p).replace("_vaf.tsv", "")
+            df["sample"] = sample
+            rows.append(df)
+        except Exception as e:
+            st.warning(f"Error reading VAF file {p}: {e}")
+    if not rows:
+        return pd.DataFrame()
+    vaf = pd.concat(rows, ignore_index=True)
+    # Numeric coercion
+    for c in ("POS", "DP", "AD_ALT", "AF"):
+        if c in vaf.columns:
+            vaf[c] = pd.to_numeric(vaf[c], errors="coerce")
+    vaf = add_base_column(vaf)
+    return vaf
+
+
+def infer_mixed_strains(vaf_df: pd.DataFrame) -> str:
+    """Very simple heuristic: mixed strains if there are enough mid-VAF variants.
+    Returns one of: 'Likely', 'Possible', 'Unlikely'."""
+    if vaf_df is None or vaf_df.empty:
+        return "Unknown"
+    df = vaf_df.dropna(subset=["AF"]).copy()
+    n_total = len(df)
+    n_mid = int(((df["AF"] >= 0.2) & (df["AF"] <= 0.8)).sum())
+    if n_total == 0:
+        return "Unknown"
+    frac = n_mid / n_total
+    if n_mid >= 10 and frac >= 0.15:
+        return "Likely"
+    if n_mid >= 3 and frac >= 0.05:
+        return "Possible"
+    return "Unlikely"
+
+
+def detect_non_cmv_species(blast_hits_all: pd.DataFrame, base: str) -> bool:
+    if blast_hits_all is None or blast_hits_all.empty or "base" not in blast_hits_all.columns:
+        return False
+    sub = blast_hits_all[blast_hits_all["base"] == base]
+    if sub.empty:
+        return False
+    # Look for non-CMV strings in stitle
+    cmv_pat = re.compile(r"Human\s+herpesvirus\s*5|\bHCMV\b|Cytomegalovirus|NC_006273\.2", re.IGNORECASE)
+    non = sub[~sub["stitle"].fillna("").str.contains(cmv_pat)]
+    # If there are a reasonable number of non-CMV hits, flag
+    return len(non) >= 50  # threshold can be adjusted
+
+
+def plot_vaf_by_position(vaf_df: pd.DataFrame):
+    if vaf_df is None or vaf_df.empty:
+        return None
+    fig = go.Figure()
+    for sample, sdf in vaf_df.groupby("sample"):
+        sdf = sdf.sort_values("POS")
+        fig.add_trace(go.Scatter(x=sdf["POS"], y=sdf["AF"], mode="markers",
+                                 name=sample, hovertemplate="POS=%{x}<br>AF=%{y:.3f}<extra>"))
+    fig.update_layout(title="Variant Allele Frequency (AF) across genome",
+                      xaxis_title="Position (bp)", yaxis_title="AF (0-1)",
+                      yaxis=dict(range=[0,1]))
+    return fig
+
+
+def plot_af_histogram(vaf_df: pd.DataFrame):
+    if vaf_df is None or vaf_df.empty:
+        return None
+    fig = px.histogram(vaf_df, x="AF", color="sample", nbins=40, title="Distribution of AF values")
+    fig.update_xaxes(range=[0,1])
+    return fig
+
+
 # ----------------------- Filters & helpers -----------------------
 def filter_blast_merlin(blast_hits: pd.DataFrame, min_identity=85.0) -> pd.DataFrame:
     if blast_hits.empty: return blast_hits
@@ -196,10 +293,12 @@ def filter_blast_merlin(blast_hits: pd.DataFrame, min_identity=85.0) -> pd.DataF
     df = df[title_mask]
     return df[df["pident"] >= float(min_identity)]
 
+
 def filter_by_bases(df: pd.DataFrame, bases_selected: list[str]) -> pd.DataFrame:
     if df is None or df.empty or "base" not in df.columns or not bases_selected:
         return df
     return df[df["base"].isin(bases_selected)].copy()
+
 
 # ----------------------- Plotting -----------------------
 def plot_alignment_stacked(df: pd.DataFrame):
@@ -210,17 +309,20 @@ def plot_alignment_stacked(df: pd.DataFrame):
     fig.update_layout(barmode="stack", xaxis_title="Reads", yaxis_title="Sample", title="Mapped vs Unmapped Reads per Sample")
     return fig
 
+
 def plot_alignment_pct(df: pd.DataFrame, col: str, title: str):
     if df.empty or col not in df: return None
     fig = px.bar(df, x="sample", y=col, title=title)
     fig.update_yaxes(title="%"); fig.update_xaxes(tickangle=45)
     return fig
 
+
 def plot_avg_depth(gene_df: pd.DataFrame):
     if gene_df.empty: return None
     fig = px.bar(gene_df, x="gene", y="avg_depth", color="sample", title="Average Depth per CMV Gene")
     fig.update_yaxes(title="Average Depth"); fig.update_xaxes(title="Gene")
     return fig
+
 
 def plot_blast_full_heatmap(blast_hits: pd.DataFrame, bin_size=100):
     if blast_hits.empty: return None
@@ -245,6 +347,7 @@ def plot_blast_full_heatmap(blast_hits: pd.DataFrame, bin_size=100):
     fig.update_layout(shapes=shapes)
     return fig
 
+
 def plot_blast_region_heatmap(blast_hits: pd.DataFrame, region: dict):
     if blast_hits.empty: return None
     rstart, rend = int(region["start"]), int(region["end"])
@@ -262,7 +365,7 @@ def plot_blast_region_heatmap(blast_hits: pd.DataFrame, region: dict):
         if left > right: continue
         i = sidx.get(r["sample"])
         a, b = left - rstart, right - rstart + 1
-        p = float(r["pident"])
+        p = float(r["pident"]) 
         sums[i, a:b] += p
         counts[i, a:b] += 1
 
@@ -272,6 +375,7 @@ def plot_blast_region_heatmap(blast_hits: pd.DataFrame, region: dict):
                     labels=dict(color="% Identity"),
                     title=f"BLAST % Identity: {region['name']} ({rstart}-{rend})")
     return fig
+
 
 def plot_per_base_heatmap(per_base_df: pd.DataFrame, gene: str, bin_size: int | None = None):
     region_map = {r["name"]: (r["start"], r["end"]) for r in CONSERVE_REGIONS}
@@ -288,6 +392,7 @@ def plot_per_base_heatmap(per_base_df: pd.DataFrame, gene: str, bin_size: int | 
     fig = px.imshow(pivot, aspect="auto", color_continuous_scale="Viridis", labels=dict(color="Depth"), title=title)
     return fig
 
+
 def plot_genome_coverage(per_base_df: pd.DataFrame):
     if per_base_df.empty: return None
     fig = go.Figure()
@@ -300,6 +405,7 @@ def plot_genome_coverage(per_base_df: pd.DataFrame):
     fig.update_layout(title="Per-base Depth Across Genome", xaxis_title="Genomic Position",
                       yaxis_title="Depth (log)", yaxis_type="log", xaxis_range=[0, 235000])
     return fig
+
 
 # ----------------------- FastQC helpers -----------------------
 def parse_fastqc_zip_summary(zip_path: str) -> pd.DataFrame:
@@ -318,6 +424,7 @@ def parse_fastqc_zip_summary(zip_path: str) -> pd.DataFrame:
     except Exception as e:
         st.warning(f"Failed to read {zip_path}: {e}")
     return pd.DataFrame(rows)
+
 
 def embed_fastqc_html(path: str):
     try:
@@ -338,6 +445,7 @@ def embed_fastqc_html(path: str):
     except Exception as e:
         st.warning(f"Preview failed for {path}: {e}")
 
+
 # ----------------------- UI -----------------------
 st.set_page_config(page_title="CMV Interactive Report", layout="wide")
 st.title("📊 CMV Interactive Report")
@@ -346,6 +454,7 @@ with st.sidebar:
     st.header("Inputs")
     csv_dir = st.text_input("CSV directory (gene/per_base/summary/blast_top5)")
     blast_dir = st.text_input("BLAST directory (*_blast.tsv)")
+    vaf_dir = st.text_input("VAF directory (*_vaf.tsv)")  # NEW
     bam_stats_dir = st.text_input("BAM stats directory (*_flagstat.txt, *_stats.txt)")
     fastqc_dir = st.text_input("FastQC directory (*_fastqc.html, *_fastqc.zip)")
     min_identity = st.number_input("BLAST min % identity", min_value=0.0, max_value=100.0, value=85.0, step=1.0)
@@ -355,6 +464,7 @@ with st.sidebar:
 if csv_dir and blast_dir:
     gene_df, per_base_df, bam_df, blast_top5, blast_hits_all = load_all(csv_dir, blast_dir)
     align_df = load_alignment_stats(bam_stats_dir) if bam_stats_dir else pd.DataFrame()
+    vaf_df = load_vaf_tables(vaf_dir) if vaf_dir else pd.DataFrame()
 
     # ---------------- FIX: Build base list from core CMV CSVs only ----------------
     core_sets = []
@@ -384,6 +494,7 @@ if csv_dir and blast_dir:
     blast_top5     = keep_bases(blast_top5)
     blast_hits_all = keep_bases(blast_hits_all)
     align_df       = keep_bases(align_df)
+    vaf_df         = keep_bases(vaf_df)
     # ------------------------------------------------------------------------------
 
     if not all_bases:
@@ -401,6 +512,7 @@ if csv_dir and blast_dir:
             "blast_top5.csv": names(blast_top5),
             "*.tsv (BLAST hits)": names(blast_hits_all),
             "BAM stats": names(align_df),
+            "VAF tables": names(vaf_df),
         })
 
     with st.sidebar:
@@ -413,10 +525,10 @@ if csv_dir and blast_dir:
 
         # show which technical variants will be included
         if bases_selected:
-            st.markdown("**Variants included:**")
+            st.markdown("**Files Included:**")
             for b in bases_selected:
                 variants_b = sorted(set(
-                    s for df in [gene_df, per_base_df, bam_df, blast_top5, blast_hits_all, align_df]
+                    s for df in [gene_df, per_base_df, bam_df, blast_top5, blast_hits_all, align_df, vaf_df]
                     if df is not None and not df.empty
                     for s, bb in zip(df["sample"], df["base"])
                     if bb == b
@@ -433,6 +545,7 @@ if csv_dir and blast_dir:
     f_align = filter_by_bases(align_df, bases_selected)
     sel_hits = filter_by_bases(blast_hits_all, bases_selected)
     sel_hits = filter_blast_merlin(sel_hits, min_identity=float(min_identity))
+    f_vaf   = filter_by_bases(vaf_df, bases_selected)
 
     # 1) Alignment
     with st.expander("1. Alignment Statistics (BWA-MEM)", expanded=True):
@@ -470,10 +583,11 @@ if csv_dir and blast_dir:
         if not f_top5.empty:
             st.subheader("Top BLAST species per sample")
             st.dataframe(f_top5.drop(columns=["base"]), use_container_width=True)
-            fig = px.bar(f_top5, x="sample", y="total_hits", color="species",
-                         title="Top BLAST Species per Sample and Read")
-            fig.update_xaxes(tickangle=45)
-            st.plotly_chart(fig, use_container_width=True)
+            if "species" in f_top5.columns and "total_hits" in f_top5.columns:
+                fig = px.bar(f_top5, x="sample", y="total_hits", color="species",
+                             title="Top BLAST Species per Sample and Read")
+                fig.update_xaxes(tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No BLAST summary (top5) for this sample.")
 
@@ -567,5 +681,46 @@ if csv_dir and blast_dir:
                 st.info("No FastQC HTML or ZIP files found.")
         else:
             st.info("Provide a valid FastQC directory to list reports.")
+
+    # 7) Variants (LoFreq VAF)
+    with st.expander("7. Variants (LoFreq VAF)", expanded=True):
+        if f_vaf is None or f_vaf.empty:
+            st.info("No VAF tables loaded. Provide a VAF directory containing *_vaf.tsv files.")
+        else:
+            # Show table
+            st.subheader("VAF table (selected samples)")
+            st.dataframe(
+                f_vaf[[c for c in ["sample","CHROM","POS","REF","ALT","DP","AD_ALT","AF","base"] if c in f_vaf.columns]]
+                .sort_values(["sample","POS"]).reset_index(drop=True)
+                .drop(columns=["base"]),
+                use_container_width=True,
+            )
+
+            # Plots
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = plot_vaf_by_position(f_vaf)
+                if fig: st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = plot_af_histogram(f_vaf)
+                if fig: st.plotly_chart(fig, use_container_width=True)
+
+            # Co-infection / mixed strains flags per base
+            st.subheader("Co-infection / Mixed-strain heuristic")
+            for b in bases_selected:
+                vf_b = f_vaf[f_vaf["base"] == b] if "base" in f_vaf.columns else pd.DataFrame()
+                verdict = infer_mixed_strains(vf_b)
+                non_cmv = detect_non_cmv_species(blast_hits_all, b)
+                msg = f"**{b}:** Mixed HCMV strains: **{verdict}**"
+                if non_cmv:
+                    msg += "  ·  Non-CMV viral reads detected in BLAST: **Yes**"
+                else:
+                    msg += "  ·  Non-CMV viral reads detected in BLAST: **No/Low**"
+                if verdict == "Likely" or non_cmv:
+                    st.warning(msg)
+                elif verdict == "Possible":
+                    st.info(msg)
+                else:
+                    st.success(msg)
 else:
     st.info("Enter at least CSV and BLAST directories to load data.")

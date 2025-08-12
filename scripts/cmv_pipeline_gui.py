@@ -15,6 +15,7 @@ from extract_cmv_bam_metrics import run_bam_metrics  # unchanged
 from summarize_blast_hits import summarize_blast_hits  # unchanged
 # NOTE: removed: import generate_final_report
 
+
 class CollapsibleStep(tk.Frame):
     def __init__(self, parent, step_name, labels, browse_types=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
@@ -66,6 +67,7 @@ class CollapsibleStep(tk.Frame):
         elif bt == 'file':
             path = filedialog.askopenfilename(title=f"Select {label}")
         else:
+            # Special cases if you use custom types
             if 'reference genome' in lbl_lower:
                 path = filedialog.askopenfilename(filetypes=[
                     ("FASTA files", "*.fa *.fasta *.fna"), ("All files", "*.*")
@@ -112,7 +114,8 @@ class PipelineGUI(tk.Tk):
             "extract_cmv_metrics": ["BAM Directory", "Output Directory"],
             "blast_summary": ["FASTQ Directory", "BLAST DB Directory", "Output Directory", "Threads"],
             "summarize_blast_hits": ["BLAST TSV Directory", "Output Directory"],
-            # New final step: just run Streamlit app and open it
+            "variant_calling_vaf": ["BAM Directory", "Reference FASTA", "Output Directory", "Threads"],
+            # Final step: launch Streamlit app
             "interactive_report_streamlit": ["Path to app.py", "Port (e.g., 8501)"]
         }
 
@@ -131,6 +134,7 @@ class PipelineGUI(tk.Tk):
             "csv directory": "dir",
             "path to app.py": "file",
             "port (e.g., 8501)": "text",
+            "reference fasta": "file"
         }
 
         self.steps = {}
@@ -157,7 +161,6 @@ class PipelineGUI(tk.Tk):
 
         for step_name, fields in self.steps_info.items():
             step = CollapsibleStep(self.scrollable_frame, step_name, fields, self.browse_types)
-            # sensible defaults for Streamlit step
             if step_name == "interactive_report_streamlit":
                 step.entries["Port (e.g., 8501)"].insert(0, "8501")
             step.pack(fill='x', pady=5)
@@ -250,23 +253,31 @@ class PipelineGUI(tk.Tk):
         ]
         self.add_log("Starting Streamlit: " + " ".join(shlex.quote(c) for c in cmd))
 
+        # Pass env flag so app.py clears Streamlit cache on startup
+        env = os.environ.copy()
+        env["CLEAR_CACHE_ON_START"] = "1"
+
         try:
-            # Start Streamlit and stream logs into the GUI
+            preexec = os.setsid if os.name != "nt" else None
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+
             self._streamlit_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                universal_newlines=True
+                universal_newlines=True,
+                env=env,
+                preexec_fn=preexec,
+                creationflags=creationflags
             )
         except FileNotFoundError:
-            self.add_log("❌ Could not find the 'streamlit' executable. Is it installed in this environment?")
+            self.add_log("❌ Could not find the 'streamlit' executable. Is it installed?")
             return False
         except Exception as e:
             self.add_log(f"❌ Failed to start Streamlit: {e}")
             return False
 
-        # Log stream in background
         def _pump_logs():
             try:
                 for line in self._streamlit_proc.stdout:
@@ -276,13 +287,10 @@ class PipelineGUI(tk.Tk):
 
         threading.Thread(target=_pump_logs, daemon=True).start()
 
-        # Give Streamlit a moment to boot, then open browser
         def _open_when_ready():
-            # Simple retry loop to open browser
             url = f"http://localhost:{port}"
             for _ in range(20):
                 time.sleep(0.5)
-                # Try to open once; if successful, exit loop
                 try:
                     webbrowser.open_new_tab(url)
                     break
@@ -351,6 +359,12 @@ class PipelineGUI(tk.Tk):
                     check_fields(["BLAST TSV Directory", "Output Directory"])
                     summarize_blast_hits(vals["BLAST TSV Directory"], vals["Output Directory"])
                     success = True
+                elif name == "variant_calling_vaf":
+                    check_fields(["BAM Directory", "Reference FASTA", "Output Directory", "Threads"])
+                    success = self.run_script_live(
+                        "variant_calling_vaf.sh",
+                        vals["BAM Directory"], vals["Reference FASTA"], vals["Output Directory"], vals["Threads"]
+                    )
                 elif name == "interactive_report_streamlit":
                     check_fields(["Path to app.py", "Port (e.g., 8501)"])
                     app_path = vals["Path to app.py"]
@@ -415,6 +429,7 @@ class PipelineGUI(tk.Tk):
                 if os.name == "nt":
                     self._streamlit_proc.terminate()
                 else:
+                    # only works because we started Streamlit in its own process group
                     os.killpg(os.getpgid(self._streamlit_proc.pid), signal.SIGTERM)
         except Exception:
             pass
