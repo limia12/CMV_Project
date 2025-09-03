@@ -150,26 +150,26 @@ This report has several sections (you can expand and collapse them):
 
 7. Project Structure
 
-CMV_Pipeline_Project/
-├── scripts/
-│   ├── cmv_pipeline_gui.py          # Main window application
-│   ├── app.py                       # Interactive report
-│   ├── alignment_bwa-mem.sh         # Alignment script
-│   ├── filtering.sh                 # Trimming and FastQC
-│   ├── index_genome.sh              # Indexing
-│   ├── split_interleaved_fastq.sh   # Splitting interleaved reads
-│   ├── unaligned_reads.sh           # Extract unmapped reads
-│   ├── variant_calling_vaf.sh       # Variant calling
-│   ├── 02_blast_cmv_summary.sh      # BLAST
-│   ├── extract_cmv_bam_metrics.py   # Coverage metrics
-│   └── summarize_blast_hits.py      # BLAST summaries
-├── fastq/                           # Example FASTQs
-├── output/                          # Outputs: BAMs, CSVs, VCFs, plots
-├── References/                      # Reference genomes
-├── Simulated_Reads/                 # Simulated data
-├── TEST/                            # Small test datasets
-├── environment.yml                  # Conda environment
-└── requirements.txt                 # Python dependencies
+        CMV_Pipeline_Project/
+        ├── scripts/
+        │   ├── cmv_pipeline_gui.py          # Main window application
+        │   ├── app.py                       # Interactive report
+        │   ├── alignment_bwa-mem.sh         # Alignment script
+        │   ├── filtering.sh                 # Trimming and FastQC
+        │   ├── index_genome.sh              # Indexing
+        │   ├── split_interleaved_fastq.sh   # Splitting interleaved reads
+        │   ├── unaligned_reads.sh           # Extract unmapped reads
+        │   ├── variant_calling_vaf.sh       # Variant calling
+        │   ├── 02_blast_cmv_summary.sh      # BLAST
+        │   ├── extract_cmv_bam_metrics.py   # Coverage metrics
+        │   └── summarize_blast_hits.py      # BLAST summaries
+        ├── fastq/                           # Example FASTQs
+        ├── output/                          # Outputs: BAMs, CSVs, VCFs, plots
+        ├── References/                      # Reference genomes
+        ├── Simulated_Reads/                 # Simulated data
+        ├── TEST/                            # Small test datasets
+        ├── environment.yml                  # Conda environment
+        └── requirements.txt                 # Python dependencies
 
 8. Tips if You Get Stuck
 
