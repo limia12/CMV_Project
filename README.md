@@ -22,16 +22,16 @@ At the end, it creates an **interactive report** you can open in your web browse
    git clone https://github.com/<your-username>/CMV_Pipeline_Project.git
    cd CMV_Pipeline_Project
 
-    Create and activate the environment:
+2. Create and activate the environment:
+    ```bash
+    conda env create -f environment.yml
+    conda activate cmv_pipeline
 
-conda env create -f environment.yml
-conda activate cmv_pipeline
-
-Install the Python packages:
+3. Install the Python packages:
 
     pip install -r requirements.txt
 
-2. Running the Application
+4. Running the Application
 
 To start the program, type:
 
@@ -45,11 +45,12 @@ For most steps you’ll just need to browse for the input folder and output fold
 When you’re ready, click Run Pipeline.
 The program will run the steps you selected and show progress in the window.
 At the end, it will open your interactive report in a browser.
-3. What Each Step Does
+
+5. What Each Step Does
 
 Here’s a short explanation of the options you’ll see in the window:
 
-    Split interleaved FASTQs
+### Split interleaved FASTQs
 
         Use this if your FASTQ files have both read pairs in one file.
 
@@ -57,7 +58,7 @@ Here’s a short explanation of the options you’ll see in the window:
 
         Output: folder where R1 and R2 files will be saved
 
-    Filtering (quality trimming + FastQC)
+### Filtering (quality trimming + FastQC)
 
         Cleans and trims your raw reads
 
@@ -65,7 +66,7 @@ Here’s a short explanation of the options you’ll see in the window:
 
         Output: will create filtered_reads/ and fastqc_results/
 
-    Index Human Genome (optional)
+### Index Human Genome (optional)
 
         Prepares the human genome reference for alignment
 
@@ -73,7 +74,7 @@ Here’s a short explanation of the options you’ll see in the window:
 
         Output: folder to save the index
 
-    Align to Human Genome (optional)
+### Align to Human Genome (optional)
 
         Aligns your reads to the human genome (to filter human reads)
 
@@ -81,78 +82,68 @@ Here’s a short explanation of the options you’ll see in the window:
 
         Output: BAM files + BAM statistics
 
-    Unaligned Reads (optional)
+### Unaligned Reads (optional)
 
         Extracts the reads that did not align to the human genome
 
-    Index CMV Genome
+### Index CMV Genome
 
         Same as human indexing, but for CMV
 
-    Align to CMV Genome
+### Align to CMV Genome
 
         Aligns your reads to the CMV reference
 
         Output: BAM files and alignment stats
 
-    BLAST
+### BLAST
 
         Runs BLAST on the reads to check for CMV and other viruses
 
-    Variant Calling (LoFreq)
+### Variant Calling (LoFreq)
 
         Finds small variants (SNPs/indels) and makes a table of variant allele frequencies
 
-    Generate Report
+### Generate Report
 
         Collects all the outputs and opens the interactive report in your browser
 
-4. The Interactive Report
+---
 
-When the pipeline finishes, your browser will open with the CMV Interactive Report.
+## 6. The Interactive Report
+
+When the pipeline finishes, your browser will open with the **CMV Interactive Report**.  
 This report has several sections (you can expand and collapse them):
 
-    Alignment Statistics
+### Alignment Statistics
+- How many reads mapped vs unmapped  
+- Percentage properly paired  
+- Average insert size  
 
-        How many reads mapped vs unmapped
+### Coverage per Gene
+- Bar chart showing average depth across key CMV genes  
 
-        Percentage properly paired
+### BLAST Results
+- Top species detected in your data  
+- Heatmaps showing BLAST identity across the genome and within conserved regions  
 
-        Average insert size
+### Per-base Coverage
+- Heatmaps for depth of coverage within specific CMV regions  
 
-    Coverage per Gene
+### Genome-wide Coverage
+- Line plot of depth across the whole CMV genome  
 
-        Bar chart showing average depth across key CMV genes
+### FastQC Reports
+- Summary tables for read quality checks  
+- Option to preview and download the full FastQC reports  
 
-    BLAST Results
+### Variants (LoFreq VAF)
+- Table of variants with allele frequencies  
+- Plots showing allele frequency distribution and positions  
+- A simple flag to suggest if there may be mixed strains or co-infection  
 
-        Top species detected in your data
 
-        Heatmaps showing BLAST identity across the genome and within conserved regions
-
-    Per-base Coverage
-
-        Heatmaps for depth of coverage within specific CMV regions
-
-    Genome-wide Coverage
-
-        Line plot of depth across the whole CMV genome
-
-    FastQC Reports
-
-        Summary tables for read quality checks
-
-        Option to preview and download the full FastQC reports
-
-    Variants (LoFreq VAF)
-
-        Table of variants with allele frequencies
-
-        Plots showing allele frequency distribution and positions
-
-        A simple flag to suggest if there may be mixed strains or co-infection
-
-5. Project Structure
+7. Project Structure
 
 CMV_Pipeline_Project/
 ├── scripts/
@@ -175,7 +166,7 @@ CMV_Pipeline_Project/
 ├── environment.yml                  # Conda environment
 └── requirements.txt                 # Python dependencies
 
-6. Tips if You Get Stuck
+8. Tips if You Get Stuck
 
     If nothing appears in the report, check that your CSV and BLAST folders are set correctly.
 
