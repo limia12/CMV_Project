@@ -33,80 +33,85 @@ At the end, it creates an **interactive report** you can open in your web browse
 
 4. Running the Application
 
-To start the program, type:
+### To start the program, type:
 
-python scripts/cmv_pipeline_gui.py
+- python scripts/cmv_pipeline_gui.py
 
-A window will open.
-This is where you choose what parts of the pipeline you want to run.
-Each step can be turned on or off with a checkbox.
-For most steps you’ll just need to browse for the input folder and output folder, and sometimes pick the number of cores (threads) to use.
+- A window will open.
 
-When you’re ready, click Run Pipeline.
-The program will run the steps you selected and show progress in the window.
-At the end, it will open your interactive report in a browser.
+- This is where you choose what parts of the pipeline you want to run.
 
-5. What Each Step Does
+- Each step can be turned on or off with a checkbox.
+
+- For most steps you’ll just need to browse for the input folder and output folder, and sometimes pick the number of cores (threads) to use.
+
+- When you’re ready, click Run Pipeline.
+
+- The program will run the steps you selected and show progress in the window.
+
+- At the end, it will open your interactive report in a browser.
+
+## 5. What Each Step Does
 
 Here’s a short explanation of the options you’ll see in the window:
 
 ### Split interleaved FASTQs
 
-        Use this if your FASTQ files have both read pairs in one file.
+- Use this if your FASTQ files have both read pairs in one file.
 
-        Input: folder with interleaved FASTQs
+- Input: folder with interleaved FASTQs
 
-        Output: folder where R1 and R2 files will be saved
+- Output: folder where R1 and R2 files will be saved
 
 ### Filtering (quality trimming + FastQC)
 
-        Cleans and trims your raw reads
+- Cleans and trims your raw reads
 
-        Input: folder with FASTQs
+- Input: folder with FASTQs
 
-        Output: will create filtered_reads/ and fastqc_results/
+- Output: will create filtered_reads/ and fastqc_results/
 
 ### Index Human Genome (optional)
 
-        Prepares the human genome reference for alignment
+- Prepares the human genome reference for alignment
 
-        Input: folder with the reference FASTA
+- Input: folder with the reference FASTA
 
-        Output: folder to save the index
+- Output: folder to save the index
 
 ### Align to Human Genome (optional)
 
-        Aligns your reads to the human genome (to filter human reads)
+- Aligns your reads to the human genome (to filter human reads)
 
-        Input: FASTQ folder + indexed reference
+- Input: FASTQ folder + indexed reference
 
-        Output: BAM files + BAM statistics
+- Output: BAM files + BAM statistics
 
 ### Unaligned Reads (optional)
 
-        Extracts the reads that did not align to the human genome
+- Extracts the reads that did not align to the human genome
 
 ### Index CMV Genome
 
-        Same as human indexing, but for CMV
+- Same as human indexing, but for CMV
 
 ### Align to CMV Genome
 
-        Aligns your reads to the CMV reference
+- Aligns your reads to the CMV reference
 
-        Output: BAM files and alignment stats
+- Output: BAM files and alignment stats
 
 ### BLAST
 
-        Runs BLAST on the reads to check for CMV and other viruses
+- Runs BLAST on the reads to check for CMV and other viruses
 
 ### Variant Calling (LoFreq)
 
-        Finds small variants (SNPs/indels) and makes a table of variant allele frequencies
+- Finds small variants (SNPs/indels) and makes a table of variant allele frequencies
 
 ### Generate Report
 
-        Collects all the outputs and opens the interactive report in your browser
+- Collects all the outputs and opens the interactive report in your browser
 
 ---
 
