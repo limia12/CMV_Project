@@ -14,6 +14,66 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
+# --- UPDATED: native folder-picker + safe state sync for Streamlit ---
+def _pick_directory_dialog(initial: str | None = None) -> str | None:
+    """Open a native folder picker (tkinter). Returns path or None on cancel/failure."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        # try to bring dialog to front (may be ignored on some platforms)
+        try:
+            root.call('wm', 'attributes', '.', '-topmost', True)
+        except Exception:
+            pass
+        directory = filedialog.askdirectory(initialdir=initial or os.getcwd())
+        root.destroy()
+        return directory or None
+    except Exception:
+        return None
+
+def _sync_from_text(state_key: str):
+    """Callback: keep source-of-truth state in sync with what the user typed."""
+    st.session_state[state_key] = st.session_state.get(f"{state_key}_text", "").strip()
+
+def dir_input(label: str, state_key: str, help_text: str | None = None, placeholder: str | None = None) -> str:
+    """
+    Render a text input with an adjacent 'Browse…' button that opens a folder picker.
+
+    - The true value lives in st.session_state[state_key].
+    - The text input uses its *own* widget key (state_key + '_text') and mirrors that value.
+    """
+    # initialize source-of-truth
+    if state_key not in st.session_state:
+        st.session_state[state_key] = ""
+
+    cols = st.columns([4, 1])
+    with cols[0]:
+        # IMPORTANT: we do NOT assign to the widget's key outside its callback
+        st.text_input(
+            label,
+            value=st.session_state[state_key],              # reflect source-of-truth
+            key=f"{state_key}_text",                       # widget has its own key
+            help=help_text,
+            placeholder=placeholder,
+            on_change=_sync_from_text,                     # sync back when user edits
+            args=(state_key,),
+        )
+    with cols[1]:
+        if st.button("Browse…", key=f"{state_key}_browse"):
+            chosen = _pick_directory_dialog(initial=st.session_state[state_key] or None)
+            if chosen:
+                # update only the source-of-truth, then rerun so the text box value refreshes
+                st.session_state[state_key] = chosen
+                try:
+                    st.rerun()  # Streamlit >= 1.25
+                except Exception:
+                    st.experimental_rerun()  # older Streamlit
+
+    return st.session_state[state_key]
+
+
 # --- optional: clear Streamlit caches on startup if env flag is set ---
 # Clear Streamlit caches on startup when launched from the GUI
 if os.environ.get("CLEAR_CACHE_ON_START") == "1":
@@ -49,6 +109,22 @@ _SUFFIX_PATTERNS = [
 ]
 
 def canonical_sample(name: str) -> str:
+    """
+    Canonicalize a sample or filename by removing common technical suffixes.
+
+    This function repeatedly strips known suffix patterns (e.g., read pair tags,
+    sorting/duplication tags, file extensions like `.bam`) so that files that
+    belong to the same biological sample map to the same base sample name.
+
+    Args:
+        name (str): The original filename or sample identifier.
+
+    Returns:
+        str: The canonical "base" sample name with technical suffixes removed.
+
+    Raises:
+        None
+    """
     s = name
     changed = True
     while changed:
@@ -62,6 +138,22 @@ def canonical_sample(name: str) -> str:
 
 
 def add_base_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a 'base' column to a DataFrame based on the 'sample' column.
+
+    The 'base' value is computed by canonicalizing each sample name so that
+    technical variants of the same biological sample are grouped together.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame that should contain a 'sample' column.
+
+    Returns:
+        pd.DataFrame: A copy of the input DataFrame with an added 'base' column
+                      (if 'sample' exists); otherwise, the original DataFrame.
+
+    Raises:
+        None
+    """
     if df is not None and not df.empty and "sample" in df.columns:
         df = df.copy()
         df["base"] = df["sample"].astype(str).apply(canonical_sample)
@@ -69,6 +161,23 @@ def add_base_column(df: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------- Data loaders -----------------------
 def _read_csv_list(files, **read_kwargs) -> pd.DataFrame:
+    """
+    Read and concatenate multiple CSV files into a single DataFrame.
+
+    This helper attempts to parse each CSV, concatenates non-empty results,
+    and coerces some common numeric columns to numeric dtype when present.
+
+    Args:
+        files (Iterable[str]): A list or iterable of CSV file paths to read.
+        **read_kwargs: Additional keyword args forwarded to `pd.read_csv()`.
+
+    Returns:
+        pd.DataFrame: A concatenated DataFrame (or an empty DataFrame if none
+                      could be read).
+
+    Raises:
+        None
+    """
     dfs = []
     for f in files:
         try:
@@ -88,6 +197,28 @@ def _read_csv_list(files, **read_kwargs) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_all(csv_dir: str, blast_dir: str):
+    """
+    Load core CMV result tables from CSV directory plus BLAST hits from TSV.
+
+    This collects:
+      - `*_gene.csv`        (gene-level coverage)
+      - `*_per_base.csv`    (per-base coverage)
+      - `*_summary.csv`     (BAM alignment summaries)
+      - `*_blast_top5.csv`  (top species summary)
+      - `*_blast.tsv`       (raw BLAST hits; tab-separated)
+
+    Args:
+        csv_dir (str): Directory containing the pipeline output CSV files.
+        blast_dir (str): Directory containing `*_blast.tsv` files.
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            (gene_df, per_base_df, bam_df, blast_top5, blast_hits)
+            Each DataFrame may be empty if no files were found.
+
+    Raises:
+        None
+    """
     gene_df     = _read_csv_list(glob.glob(os.path.join(csv_dir, "*_gene.csv")))
     per_base_df = _read_csv_list(glob.glob(os.path.join(csv_dir, "*_per_base.csv")))
     bam_df      = _read_csv_list(glob.glob(os.path.join(csv_dir, "*_summary.csv")))
@@ -122,6 +253,24 @@ def load_all(csv_dir: str, blast_dir: str):
 
 @st.cache_data(show_spinner=False)
 def load_alignment_stats(bam_stats_dir: str) -> pd.DataFrame:
+    """
+    Parse samtools flagstat and stats summaries into a single table.
+
+    This function reads:
+      - `*_flagstat.txt` for totals, mapped %, singletons, duplicates, etc.
+      - `*_stats.txt`    for insert size mean/SD and average read length.
+
+    Args:
+        bam_stats_dir (str): Directory containing `*_flagstat.txt` and `*_stats.txt`.
+
+    Returns:
+        pd.DataFrame: A DataFrame with alignment metrics per sample. Contains a
+                      'base' column for canonical grouping. Returns empty DataFrame
+                      if nothing could be parsed.
+
+    Raises:
+        None
+    """
     def _first_int(s):
         m = re.search(r"(\d+)", s);  return int(m.group(1)) if m else 0
     def _first_float(s):
@@ -202,7 +351,22 @@ def load_alignment_stats(bam_stats_dir: str) -> pd.DataFrame:
 # ----------------------- NEW: VAF loaders & helpers -----------------------
 @st.cache_data(show_spinner=False)
 def load_vaf_tables(vaf_dir: str) -> pd.DataFrame:
-    """Load LoFreq VAF tables: expects *_vaf.tsv with header CHROM POS REF ALT DP AD_ALT AF."""
+    """
+    Load LoFreq VAF tables from a directory.
+
+    Expects files named like `*_vaf.tsv` with columns:
+    CHROM, POS, REF, ALT, DP, AD_ALT, AF.
+
+    Args:
+        vaf_dir (str): Directory containing VAF TSV files.
+
+    Returns:
+        pd.DataFrame: Concatenated VAF table with 'sample' and 'base' columns added.
+                      Returns an empty DataFrame if nothing is found or loaded.
+
+    Raises:
+        None
+    """
     if not vaf_dir or not os.path.isdir(vaf_dir):
         return pd.DataFrame()
     paths = glob.glob(os.path.join(vaf_dir, "*_vaf.tsv"))
@@ -229,8 +393,22 @@ def load_vaf_tables(vaf_dir: str) -> pd.DataFrame:
 
 
 def infer_mixed_strains(vaf_df: pd.DataFrame) -> str:
-    """Very simple heuristic: mixed strains if there are enough mid-VAF variants.
-    Returns one of: 'Likely', 'Possible', 'Unlikely'."""
+    """
+    Heuristically infer mixed strains from VAF distribution.
+
+    Uses a simple rule: count mid-frequency variants (0.2 ≤ AF ≤ 0.8).
+    If enough such variants exist and the fraction is sufficiently large,
+    mixed infection is considered 'Likely' or 'Possible'.
+
+    Args:
+        vaf_df (pd.DataFrame): VAF DataFrame containing at least an 'AF' column.
+
+    Returns:
+        str: One of {"Likely", "Possible", "Unlikely", "Unknown"}.
+
+    Raises:
+        None
+    """
     if vaf_df is None or vaf_df.empty:
         return "Unknown"
     df = vaf_df.dropna(subset=["AF"]).copy()
@@ -247,6 +425,22 @@ def infer_mixed_strains(vaf_df: pd.DataFrame) -> str:
 
 
 def detect_non_cmv_species(blast_hits_all: pd.DataFrame, base: str) -> bool:
+    """
+    Detect presence of notable non-CMV BLAST hits for a given base sample.
+
+    Checks the 'stitle' field of BLAST hits to see if matches are *not* CMV/HCMV.
+    If a threshold number of non-CMV hits is reached, returns True.
+
+    Args:
+        blast_hits_all (pd.DataFrame): BLAST hits across all samples, with 'base' and 'stitle'.
+        base (str): Canonical base sample ID to evaluate.
+
+    Returns:
+        bool: True if non-CMV hits exceed the built-in threshold; False otherwise.
+
+    Raises:
+        None
+    """
     if blast_hits_all is None or blast_hits_all.empty or "base" not in blast_hits_all.columns:
         return False
     sub = blast_hits_all[blast_hits_all["base"] == base]
@@ -260,6 +454,18 @@ def detect_non_cmv_species(blast_hits_all: pd.DataFrame, base: str) -> bool:
 
 
 def plot_vaf_by_position(vaf_df: pd.DataFrame):
+    """
+    Build a scatter plot of AF (allele frequency) by genomic position per sample.
+
+    Args:
+        vaf_df (pd.DataFrame): VAF DataFrame with 'sample', 'POS', and 'AF' columns.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly figure if data exists; otherwise None.
+
+    Raises:
+        None
+    """
     if vaf_df is None or vaf_df.empty:
         return None
     fig = go.Figure()
@@ -274,6 +480,18 @@ def plot_vaf_by_position(vaf_df: pd.DataFrame):
 
 
 def plot_af_histogram(vaf_df: pd.DataFrame):
+    """
+    Build a histogram of AF values for selected samples.
+
+    Args:
+        vaf_df (pd.DataFrame): VAF DataFrame with 'AF' and 'sample' columns.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly histogram if data exists; otherwise None.
+
+    Raises:
+        None
+    """
     if vaf_df is None or vaf_df.empty:
         return None
     fig = px.histogram(vaf_df, x="AF", color="sample", nbins=40, title="Distribution of AF values")
@@ -283,6 +501,19 @@ def plot_af_histogram(vaf_df: pd.DataFrame):
 
 # ----------------------- Filters & helpers -----------------------
 def filter_blast_merlin(blast_hits: pd.DataFrame, min_identity=85.0) -> pd.DataFrame:
+    """
+    Filter BLAST hits to CMV (Merlin) or related titles above a minimum identity.
+
+    Args:
+        blast_hits (pd.DataFrame): BLAST hits containing 'stitle' and 'pident'.
+        min_identity (float, optional): Minimum % identity to retain. Defaults to 85.0.
+
+    Returns:
+        pd.DataFrame: Filtered BLAST hits DataFrame (may be empty).
+
+    Raises:
+        None
+    """
     if blast_hits.empty: return blast_hits
     df = blast_hits.copy()
     df = df[pd.to_numeric(df["pident"], errors="coerce").notna()]
@@ -295,6 +526,20 @@ def filter_blast_merlin(blast_hits: pd.DataFrame, min_identity=85.0) -> pd.DataF
 
 
 def filter_by_bases(df: pd.DataFrame, bases_selected: list[str]) -> pd.DataFrame:
+    """
+    Filter a DataFrame by a list of base sample IDs.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with a 'base' column.
+        bases_selected (list[str]): List of canonical base sample names to keep.
+
+    Returns:
+        pd.DataFrame: Filtered DataFrame containing only rows with 'base' in the selection.
+                      If inputs are invalid or missing 'base', returns the original DataFrame.
+
+    Raises:
+        None
+    """
     if df is None or df.empty or "base" not in df.columns or not bases_selected:
         return df
     return df[df["base"].isin(bases_selected)].copy()
@@ -302,6 +547,18 @@ def filter_by_bases(df: pd.DataFrame, bases_selected: list[str]) -> pd.DataFrame
 
 # ----------------------- Plotting -----------------------
 def plot_alignment_stacked(df: pd.DataFrame):
+    """
+    Create a stacked horizontal bar chart of mapped vs unmapped reads per sample.
+
+    Args:
+        df (pd.DataFrame): Alignment stats DataFrame with 'sample', 'mapped_reads', and 'unmapped_reads'.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly stacked bar figure or None if input is empty.
+
+    Raises:
+        None
+    """
     if df.empty: return None
     fig = go.Figure()
     fig.add_bar(y=df["sample"], x=df["mapped_reads"], orientation="h", name="Mapped reads")
@@ -311,6 +568,20 @@ def plot_alignment_stacked(df: pd.DataFrame):
 
 
 def plot_alignment_pct(df: pd.DataFrame, col: str, title: str):
+    """
+    Create a bar chart for a percentage column in the alignment stats.
+
+    Args:
+        df (pd.DataFrame): Alignment stats DataFrame with 'sample' and the given percentage column.
+        col (str): Name of the percentage column to plot (e.g., 'mapped_pct').
+        title (str): Title for the chart.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly bar figure or None if input missing/empty.
+
+    Raises:
+        None
+    """
     if df.empty or col not in df: return None
     fig = px.bar(df, x="sample", y=col, title=title)
     fig.update_yaxes(title="%"); fig.update_xaxes(tickangle=45)
@@ -318,6 +589,18 @@ def plot_alignment_pct(df: pd.DataFrame, col: str, title: str):
 
 
 def plot_avg_depth(gene_df: pd.DataFrame):
+    """
+    Create a bar chart of average depth per gene, colored by sample.
+
+    Args:
+        gene_df (pd.DataFrame): DataFrame with columns 'gene', 'avg_depth', and 'sample'.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly bar figure or None if input is empty.
+
+    Raises:
+        None
+    """
     if gene_df.empty: return None
     fig = px.bar(gene_df, x="gene", y="avg_depth", color="sample", title="Average Depth per CMV Gene")
     fig.update_yaxes(title="Average Depth"); fig.update_xaxes(title="Gene")
@@ -325,6 +608,22 @@ def plot_avg_depth(gene_df: pd.DataFrame):
 
 
 def plot_blast_full_heatmap(blast_hits: pd.DataFrame, bin_size=100):
+    """
+    Create a genome-wide BLAST % identity heatmap (binned) per sample.
+
+    Each alignment segment is spread into bins (e.g., 100 bp), and the
+    mean % identity per bin is plotted across the genome for each sample.
+
+    Args:
+        blast_hits (pd.DataFrame): BLAST hits with 'sample', 'sstart', 'send', and 'pident'.
+        bin_size (int, optional): Bin width in base pairs. Defaults to 100.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly heatmap figure or None if input is empty.
+
+    Raises:
+        None
+    """
     if blast_hits.empty: return None
     rows = []
     for _, r in blast_hits.iterrows():
@@ -349,6 +648,22 @@ def plot_blast_full_heatmap(blast_hits: pd.DataFrame, bin_size=100):
 
 
 def plot_blast_region_heatmap(blast_hits: pd.DataFrame, region: dict):
+    """
+    Create a per-base BLAST % identity heatmap for a specific conserved region.
+
+    For each sample, computes mean % identity for each position in the region
+    where BLAST alignments overlap.
+
+    Args:
+        blast_hits (pd.DataFrame): BLAST hits with 'sample', 'sstart', 'send', 'pident'.
+        region (dict): Region dict with keys {'name', 'start', 'end'}.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly heatmap or None if no data.
+
+    Raises:
+        None
+    """
     if blast_hits.empty: return None
     rstart, rend = int(region["start"]), int(region["end"])
     region_len = rend - rstart + 1
@@ -378,6 +693,20 @@ def plot_blast_region_heatmap(blast_hits: pd.DataFrame, region: dict):
 
 
 def plot_per_base_heatmap(per_base_df: pd.DataFrame, gene: str, bin_size: int | None = None):
+    """
+    Create a per-base (or binned) depth heatmap for a conserved gene/region.
+
+    Args:
+        per_base_df (pd.DataFrame): DataFrame with 'gene', 'position', 'depth', and 'sample'.
+        gene (str): Name of the conserved region (must exist in CONSERVE_REGIONS).
+        bin_size (int | None): If provided and >1, positions are binned by this size.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Heatmap figure or None if data is missing.
+
+    Raises:
+        KeyError: If the requested gene is not present in CONSERVE_REGIONS.
+    """
     region_map = {r["name"]: (r["start"], r["end"]) for r in CONSERVE_REGIONS}
     start, end = region_map[gene]
     data = per_base_df[(per_base_df["gene"] == gene) & (per_base_df["position"] >= start) & (per_base_df["position"] <= end)].copy()
@@ -394,6 +723,20 @@ def plot_per_base_heatmap(per_base_df: pd.DataFrame, gene: str, bin_size: int | 
 
 
 def plot_genome_coverage(per_base_df: pd.DataFrame):
+    """
+    Plot genome-wide per-base coverage for each sample (log-scale depth).
+
+    Highlights conserved regions as translucent vertical rectangles.
+
+    Args:
+        per_base_df (pd.DataFrame): DataFrame with 'position', 'depth', and 'sample' for coverage.
+
+    Returns:
+        plotly.graph_objs._figure.Figure | None: Plotly line figure or None if input is empty.
+
+    Raises:
+        None
+    """
     if per_base_df.empty: return None
     fig = go.Figure()
     for sample, df in per_base_df.groupby("sample"):
@@ -409,6 +752,21 @@ def plot_genome_coverage(per_base_df: pd.DataFrame):
 
 # ----------------------- FastQC helpers -----------------------
 def parse_fastqc_zip_summary(zip_path: str) -> pd.DataFrame:
+    """
+    Parse a FastQC ZIP and extract the per-module summary table.
+
+    Looks for the `summary.txt` inside the ZIP and returns a table with:
+    columns: ['sample', 'module', 'status'].
+
+    Args:
+        zip_path (str): Path to a `*_fastqc.zip` file.
+
+    Returns:
+        pd.DataFrame: Summary table for the ZIP; empty DataFrame if parsing fails.
+
+    Raises:
+        None
+    """
     sample = os.path.basename(zip_path).replace("_fastqc.zip", "")
     rows = []
     try:
@@ -427,6 +785,21 @@ def parse_fastqc_zip_summary(zip_path: str) -> pd.DataFrame:
 
 
 def embed_fastqc_html(path: str):
+    """
+    Render a FastQC HTML report inside the Streamlit app.
+
+    If given a ZIP, it searches internally for `fastqc_report.html` and embeds it.
+    Otherwise, if given a direct `.html` path, it will load and display it.
+
+    Args:
+        path (str): Path to a FastQC HTML file or ZIP file containing the HTML.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
     try:
         if path.endswith(".zip"):
             with zipfile.ZipFile(path) as zf:
@@ -452,11 +825,34 @@ st.title("📊 CMV Interactive Report")
 
 with st.sidebar:
     st.header("Inputs")
-    csv_dir = st.text_input("CSV directory (gene/per_base/summary/blast_top5)")
-    blast_dir = st.text_input("BLAST directory (*_blast.tsv)")
-    vaf_dir = st.text_input("VAF directory (*_vaf.tsv)")  # NEW
-    bam_stats_dir = st.text_input("BAM stats directory (*_flagstat.txt, *_stats.txt)")
-    fastqc_dir = st.text_input("FastQC directory (*_fastqc.html, *_fastqc.zip)")
+
+    # Directory inputs with folder pickers (safe state handling)
+    csv_dir = dir_input(
+        "CSV directory (gene/per_base/summary/blast_top5)",
+        state_key="csv_dir",
+        help_text="Folder containing *_gene.csv, *_per_base.csv, *_summary.csv, *_blast_top5.csv"
+    )
+    blast_dir = dir_input(
+        "BLAST directory (*_blast.tsv)",
+        state_key="blast_dir",
+        help_text="Folder containing per-sample *_blast.tsv files"
+    )
+    vaf_dir = dir_input(
+        "VAF directory (*_vaf.tsv)",
+        state_key="vaf_dir",
+        help_text="Folder containing *_vaf.tsv tables (LoFreq)"
+    )  # NEW
+    bam_stats_dir = dir_input(
+        "BAM stats directory (*_flagstat.txt, *_stats.txt)",
+        state_key="bam_stats_dir",
+        help_text="Folder containing samtools *_flagstat.txt and *_stats.txt"
+    )
+    fastqc_dir = dir_input(
+        "FastQC directory (*_fastqc.html, *_fastqc.zip)",
+        state_key="fastqc_dir",
+        help_text="Folder containing FastQC HTML/ZIP reports"
+    )
+
     min_identity = st.number_input("BLAST min % identity", min_value=0.0, max_value=100.0, value=85.0, step=1.0)
     bin_size = st.number_input("BLAST heatmap bin (bp)", min_value=10, max_value=1000, value=100, step=10)
 
@@ -484,6 +880,15 @@ if csv_dir and blast_dir:
 
     # Filter every dataframe to these bases so plots & tables stay consistent
     def keep_bases(df):
+        """
+        Keep only rows whose 'base' is in the detected core bases.
+
+        Args:
+            df (pd.DataFrame | None): Any of the loaded DataFrames (may be None or empty).
+
+        Returns:
+            pd.DataFrame | None: Filtered DataFrame if applicable; otherwise the original.
+        """
         if df is None or df.empty or "base" not in df.columns:
             return df
         return df[df["base"].isin(core_bases)].copy()
@@ -504,6 +909,15 @@ if csv_dir and blast_dir:
     # (Optional) tiny debug helper
     with st.sidebar.expander("Debug: bases detected by source", expanded=False):
         def names(df):
+            """
+            Extract sorted base names from a DataFrame that has a 'base' column.
+
+            Args:
+                df (pd.DataFrame | None): DataFrame to inspect.
+
+            Returns:
+                list[str]: Sorted list of unique base names (empty list if unavailable).
+            """
             return sorted(df["base"].dropna().unique()) if (df is not None and not df.empty and "base" in df.columns) else []
         st.write({
             "gene.csv": names(gene_df),
@@ -630,6 +1044,15 @@ if csv_dir and blast_dir:
         if fastqc_dir and os.path.isdir(fastqc_dir):
             selected_bases_set = set(bases_selected)
             def _is_selected_fastqc(path: str) -> bool:
+                """
+                Decide whether a FastQC file belongs to a selected base.
+
+                Args:
+                    path (str): Path to a FastQC report (.html or .zip).
+
+                Returns:
+                    bool: True if its canonical sample maps to a selected base.
+                """
                 fname = os.path.basename(path)
                 sample = fname.replace("_fastqc.html", "").replace("_fastqc.zip", "")
                 return canonical_sample(sample) in selected_bases_set
