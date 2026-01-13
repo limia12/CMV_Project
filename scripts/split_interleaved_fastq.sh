@@ -1,48 +1,86 @@
 #!/bin/bash
+# split_interleaved_fastq.sh
+#
+# Purpose:
+#   Split interleaved FASTQ files into two separate files:
+#     - *_R1.fastq (read 1)
+#     - *_R2.fastq (read 2)
+#
+# Notes:
+#   - This assumes the input FASTQ is truly interleaved:
+#       R1 record (4 lines), then R2 record (4 lines), repeating.
+#   - This script processes all "*.fastq" files under <input_dir>.
+#
+# Usage:
+#   split_interleaved_fastq.sh <input_dir>
+#
+# Output:
+#   Creates: <input_dir>/split_interleaved/
+#   Writes: <base>_R1.fastq and <base>_R2.fastq for each input FASTQ.
 
-# Check if the required arguments are provided
+set -euo pipefail
+# Exit on error (-e), unset variables (-u), or failed pipeline (pipefail).
+
+# ------------------------------ Inputs ------------------------------ #
+# Require exactly one argument: the folder containing interleaved FASTQs.
 if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <input_dir>"
     exit 1
 fi
 
-# Assign arguments to variables
-input_dir="$1"
+input_dir="$1"   # Directory to search for *.fastq files.
 
-# Create the output directory 'split_interleaved' within the input directory
+# -------------------------- Output directory ------------------------ #
+# Create an output folder inside the input directory.
 output_dir="$input_dir/split_interleaved"
 mkdir -p "$output_dir"
 
-# Function to split a single fastq file
+# ---------------------------- Main logic ---------------------------- #
+# Split one interleaved FASTQ into *_R1.fastq and *_R2.fastq.
 split_fastq() {
-    fastq_file="$1"
-    output_dir="$2"
+    fastq_file="$1"   # Path to the interleaved FASTQ.
+    output_dir="$2"   # Where to write the split files.
 
-    # Get the base name of the file (without extension)
+    # Remove the ".fastq" extension to get a base name for outputs.
     base_name=$(basename "$fastq_file" .fastq)
 
-    # Create the R1 and R2 fastq files
+    # Output filenames.
     r1_file="$output_dir/${base_name}_R1.fastq"
     r2_file="$output_dir/${base_name}_R2.fastq"
 
-    # Initialize empty R1 and R2 files
-    > "$r1_file"
-    > "$r2_file"
+    # Create/overwrite output files to start clean.
+    : > "$r1_file"
+    : > "$r2_file"
 
-    # Read the interleaved fastq file and split every 4 lines
-    while read -r line1 && read -r line2 && read -r line3 && read -r line4; do
-        # Write the first 4 lines (R1) to the R1 file
-        echo -e "$line1\n$line2\n$line3\n$line4" >> "$r1_file"
-        
-        # Read the next 4 lines (R2) and write them to the R2 file
-        read -r line1 && read -r line2 && read -r line3 && read -r line4
-        echo -e "$line1\n$line2\n$line3\n$line4" >> "$r2_file"
+    # A FASTQ record is 4 lines:
+    #   1) header
+    #   2) sequence
+    #   3) plus line
+    #   4) quality string
+    #
+    # Interleaved format is:
+    #   R1 record (4 lines), then R2 record (4 lines), repeated.
+    while read -r l1 && read -r l2 && read -r l3 && read -r l4; do
+        # Write the first 4 lines as the next R1 record.
+        printf "%s\n%s\n%s\n%s\n" "$l1" "$l2" "$l3" "$l4" >> "$r1_file"
+
+        # Read the next 4 lines as the matching R2 record.
+        read -r l1 && read -r l2 && read -r l3 && read -r l4
+        printf "%s\n%s\n%s\n%s\n" "$l1" "$l2" "$l3" "$l4" >> "$r2_file"
     done < "$fastq_file"
 
-    echo "Finished splitting $fastq_file into $r1_file and $r2_file"
+    echo "[INFO] Split $(basename "$fastq_file") -> $(basename "$r1_file"), $(basename "$r2_file")"
 }
 
+# Export the function so it can be used in the subshells started by xargs.
 export -f split_fastq
 
-# Find all the fastq files and process them with xargs in parallel
-find "$input_dir" -name "*.fastq" | xargs -n 1 -P 16 -I {} bash -c 'split_fastq "$@"' _ {} "$output_dir"
+# --------------------------- Batch running -------------------------- #
+# Find all "*.fastq" files and run split_fastq on each one.
+#
+# xargs options:
+#   -n 1  = pass one FASTQ path per command
+#   -P 16 = run up to 16 files in parallel (adjust if needed)
+#   -I {} = replace {} with the FASTQ path in the command
+find "$input_dir" -name "*.fastq" \
+    | xargs -n 1 -P 16 -I {} bash -c 'split_fastq "$@"' _ {} "$output_dir"

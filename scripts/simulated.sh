@@ -1,66 +1,207 @@
-#!/bin/bash
+# #!/usr/bin/env bash
+# set -euo pipefail
 
-# Define reference path
+# # ========== CONFIG ========== #
+# REF_DIR="/home/stp/Bioinformatics/Limia/CMV_Project/References/Simulated_Reads_Ref"
+# OUT_DIR="${REF_DIR}/out_fastq/CMV_Resistant_Mix"
+# mkdir -p "$OUT_DIR/tmp"
+
+# READ_LENGTH=150
+# FRAG_MEAN=350
+# FRAG_SD=50
+# PROFILE="HS25"
+# PAIRED="-p"
+# SAMFLAG="-na"
+
+# CMV=("AD169.fasta" "Towne.fasta" "hcmv_genome.fasta")  # Merlin = hcmv_genome.fasta
+
+# # ========== FUNCTIONS ========== #
+
+# insert_merlin_resistance() {
+#     local inref="$1"
+#     local outref="$2"
+
+#     python3 - <<EOF
+# from Bio import SeqIO
+# from Bio.Seq import Seq
+
+# record = SeqIO.read("$inref", "fasta")
+# seq = list(str(record.seq))
+
+# # UL97 edits
+# replacements = {
+#     143173: "ATA",  # M460I
+#     143353: "CAA",  # H520Q
+#     143569: "GGT",  # C592G
+#     143575: "GTT",  # A594V
+#     143578: "TCA",  # L595S
+#     143602: "TGG",  # C603W
+# }
+
+# # UL54 edits
+# replacements.update({
+#     138692: "CTT",  # V812L
+#     138758: "CCC",  # A834P
+# })
+
+# # UL54 deletion: Δ981–982 (6 nt)
+# del_start = 139294
+# del_end = del_start + 6
+
+# for pos, codon in replacements.items():
+#     seq[pos:pos+3] = list(codon)
+
+# del seq[del_start:del_end]
+
+# record.seq = Seq("".join(seq))
+# SeqIO.write(record, "$outref", "fasta")
+# EOF
+# }
+
+# simulate_reads() {
+#     local fasta="$1"
+#     local outpref="$2"
+
+#     art_illumina -ss "$PROFILE" $SAMFLAG $PAIRED \
+#         -i "$fasta" \
+#         -l "$READ_LENGTH" \
+#         -f 10 \
+#         -m "$FRAG_MEAN" \
+#         -s "$FRAG_SD" \
+#         -o "$OUT_DIR/tmp/${outpref}." \
+#         -rs 42 >/dev/null
+# }
+
+# combine_fastqs() {
+#     local out="$1"
+#     local r1="$OUT_DIR/${out}_R1.fq"
+#     local r2="$OUT_DIR/${out}_R2.fq"
+
+#     > "$r1"
+#     > "$r2"
+#     for fq in $OUT_DIR/tmp/*.1.fq; do cat "$fq" >> "$r1"; done
+#     for fq in $OUT_DIR/tmp/*.2.fq; do cat "$fq" >> "$r2"; done
+
+#     gzip -f "$r1" "$r2"
+# }
+
+# # ========== MAIN ========== #
+# echo "[*] Generating CMV strains with hardcoded resistance mutations..."
+
+# for cmv in "${CMV[@]}"; do
+#     strain=$(basename "$cmv" .fasta)
+#     inref="$REF_DIR/$cmv"
+#     mutref="$OUT_DIR/tmp/${strain}_resistance.fa"
+
+#     if [[ "$cmv" == "hcmv_genome.fasta" ]]; then
+#         echo "  - Injecting resistance mutations into Merlin..."
+#         insert_merlin_resistance "$inref" "$mutref"
+#     else
+#         echo "  - Copying $strain unchanged (no mapped UL97/UL54 positions)..."
+#         cp "$inref" "$mutref"
+#     fi
+
+#     echo "  - Simulating reads for $strain..."
+#     simulate_reads "$mutref" "$strain"
+# done
+
+# echo "[*] Combining reads into one sample..."
+# combine_fastqs "CMV_ALL_RESISTANT"
+
+# echo "[\u2713] Done. Output FASTQs:"
+# echo "  $OUT_DIR/CMV_ALL_RESISTANT_R1.fq.gz"
+# echo "  $OUT_DIR/CMV_ALL_RESISTANT_R2.fq.gz"
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========== CONFIG ========== #
 REF_DIR="/home/stp/Bioinformatics/Limia/CMV_Project/References/Simulated_Reads_Ref"
-OUT_DIR="/home/stp/Bioinformatics/Limia/CMV_Project/Simulated_Reads"
+OUT_DIR="${REF_DIR}/out_fastq/CMV_UL54_Resistant"
+mkdir -p "$OUT_DIR/tmp"
 
-# Create output directory
-mkdir -p "$OUT_DIR"
+READ_LENGTH=150
+FRAG_MEAN=350
+FRAG_SD=50
+PROFILE="HS25"
+PAIRED="-p"
+SAMFLAG="-na"
 
-# Set common ART parameters
-ART="/usr/local/bin/art_illumina"  # Update this if needed
-READ_LEN=150
-FRAG_LEN=300
-STD_DEV=10
-SEQUENCER="HS25"  # Illumina HiSeq 2500
+CMV=("hcmv_genome.fasta")  # Only Merlin for UL54
 
-# Simulate reads and rename to _R1.fastq / _R2.fastq
-simulate_reads() {
-    local fasta=$1
-    local coverage=$2
-    local prefix=$3
+# ========== FUNCTIONS ========== #
 
-    # Ensure prefix ends with underscore
-    [[ "$prefix" != *_ ]] && prefix="${prefix}_"
+insert_ul54_resistance() {
+    local inref="$1"
+    local outref="$2"
 
-    $ART -ss $SEQUENCER \
-         -i "$fasta" \
-         -p \
-         -l $READ_LEN \
-         -f $coverage \
-         -m $FRAG_LEN \
-         -s $STD_DEV \
-         -o "${OUT_DIR}/${prefix}"
+    python3 - <<EOF
+from Bio import SeqIO
+from Bio.Seq import Seq
 
-    # Rename output files
-    mv "${OUT_DIR}/${prefix}1.fq" "${OUT_DIR}/${prefix}R1.fastq"
-    mv "${OUT_DIR}/${prefix}2.fq" "${OUT_DIR}/${prefix}R2.fastq"
+record = SeqIO.read("$inref", "fasta")
+seq = list(str(record.seq))
+
+# === UL54 resistance mutations ===
+# Codon 812 (nt 79487–79489): GTT (V) → CTT (L)
+seq[79486:79489] = list("CTT")
+
+# Codon 834 (nt 79419–79421): GCC (A) → CCC (P)
+seq[79418:79421] = list("CCC")
+
+# Δ981–982 (nt 78977–78982): delete 6 bp
+del seq[78976:78982]
+
+record.seq = Seq("".join(seq))
+SeqIO.write(record, "$outref", "fasta")
+EOF
 }
 
-echo "Simulating CMV only @100x..."
-simulate_reads "$REF_DIR/hcmv_genome.fasta" 100 "CMV_100x"
+simulate_reads() {
+    local fasta="$1"
+    local outpref="$2"
 
-echo "Simulating chr21 only @100x..."
-simulate_reads "$REF_DIR/chr21.fasta" 100 "chr21_100x"
+    art_illumina -ss "$PROFILE" $SAMFLAG $PAIRED \
+        -i "$fasta" \
+        -l "$READ_LENGTH" \
+        -f 10 \
+        -m "$FRAG_MEAN" \
+        -s "$FRAG_SD" \
+        -o "$OUT_DIR/tmp/${outpref}." \
+        -rs 54 >/dev/null
+}
 
-# Simulate chr21 100x + CMV at various coverages
-for cov in 1 5 10 25 50; do
-    echo "Simulating chr21 @100x + CMV @${cov}x..."
-    simulate_reads "$REF_DIR/chr21.fasta" 100 "chr21_100x_CMV_${cov}x_chr21"
-    simulate_reads "$REF_DIR/hcmv_genome.fasta" $cov "chr21_100x_CMV_${cov}x_CMV"
+combine_fastqs() {
+    local out="$1"
+    local r1="$OUT_DIR/${out}_R1.fq"
+    local r2="$OUT_DIR/${out}_R2.fq"
+
+    > "$r1"
+    > "$r2"
+    for fq in $OUT_DIR/tmp/*.1.fq; do cat "$fq" >> "$r1"; done
+    for fq in $OUT_DIR/tmp/*.2.fq; do cat "$fq" >> "$r2"; done
+
+    gzip -f "$r1" "$r2"
+}
+
+# ========== MAIN ========== #
+echo "[*] Generating Merlin CMV with UL54 resistance mutations..."
+
+for cmv in "${CMV[@]}"; do
+    strain=$(basename "$cmv" .fasta)
+    inref="$REF_DIR/$cmv"
+    mutref="$OUT_DIR/tmp/${strain}_UL54_resistance.fa"
+
+    echo "  - Injecting UL54 mutations into $strain..."
+    insert_ul54_resistance "$inref" "$mutref"
+
+    echo "  - Simulating reads for $strain with UL54 mutations..."
+    simulate_reads "$mutref" "$strain"
 done
 
-# Add CMV @100x + chr21 @100x (equal mix)
-echo "Simulating chr21 @100x + CMV @100x..."
-simulate_reads "$REF_DIR/chr21.fasta" 100 "chr21_100x_CMV_100x_chr21"
-simulate_reads "$REF_DIR/hcmv_genome.fasta" 100 "chr21_100x_CMV_100x_CMV"
+echo "[*] Combining reads into one UL54-resistant sample..."
+combine_fastqs "CMV_UL54_RESISTANT"
 
-# Simulate chr21 @100x + each herpesvirus @100x
-for virus in HHV-6A HHV-6B HHV-7 HHV-8 EBV; do
-    fasta="$REF_DIR/${virus}.fasta"
-    echo "Simulating chr21 @100x + ${virus} @100x..."
-    simulate_reads "$REF_DIR/chr21.fasta" 100 "chr21_${virus}_chr21"
-    simulate_reads "$fasta" 100 "chr21_${virus}_${virus}"
-done
-
-echo "✅ All simulations completed. FASTQ files saved in: $OUT_DIR"
+echo "[\u2713] Done. Output FASTQs:"
+echo "  $OUT_DIR/CMV_UL54_RESISTANT_R1.fq.gz"
+echo "  $OUT_DIR/CMV_UL54_RESISTANT_R2.fq.gz"
