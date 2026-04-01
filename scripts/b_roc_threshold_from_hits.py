@@ -1,31 +1,89 @@
 #!/usr/bin/env python3
 """
-CMV alignment-threshold optimisation (1D + 2D) with:
-  - ROC + AUC (rank/Mann–Whitney, no sklearn)
-  - PR curve + Average Precision (AP, no sklearn)
-  - Permutation test for AUC (optional)
-  - Bootstrap CIs for AUC, AP, selected threshold, and sens/spec/prec/F1 at that threshold
-  - 2D threshold search: mapped_hq + (breadth OR covered_bases) with heatmap + best region output
+cmv_threshold_optimize.py
 
-Notes:
-  - If your CMV BAM contains ONLY mapped reads, RPM computed as mapped/total_in_bam can be misleading.
-    The script prints a warning if it detects many samples with total_reads_in_cmv_bam ~ mapped_reads.
+Purpose
+-------
+Pick a robust CMV detection threshold that uses *multiple* metrics (not just mapped HQ reads),
+and generate dissertation-ready, well-annotated plots explaining why the chosen threshold works.
+
+This script is designed to plug directly into your existing pipeline outputs:
+
+1) Alignment summary (from cmv_pipeline_gui.py samtools metrics):
+   - cmv_alignment_summary.csv (preferred) or *_summary.csv
+   - columns include:
+       base, cmv_mapped_reads_mapq, cmv_rpm_mapq, cmv_breadth_mapq,
+       cmv_cov_bases_mapq, cmv_ref_bases, total_reads_in_cmv_bam
+
+2) Gene-level coverage (from extract_cmv_bam_metrics.py):
+   - *_gene.csv with columns including: base, gene, avg_depth, breadth
+
+3) BLAST outputs (from summarize_blast_hits.py and/or raw *_blast.tsv):
+   - *_blast_top5.csv with columns: base, sample, species, total_hits, avg_identity
+   - optionally raw *_blast.tsv loaded (outfmt 6), columns include pident, stitle, length, bitscore
+
+Truth
+-----
+Use the metadata.tsv produced by your simulator script (truth/metadata.tsv).
+It contains:
+  sample, group, truth_cmv_present, cmv_fraction_target, ...
+
+Multi-directory support
+-----------------------
+If you had to run the pipeline in batches (e.g., 256 samples crashing), you can pass multiple
+directories for CSV outputs (and optional BLAST hit dirs). The script will union them and
+deduplicate on canonical 'base' sample names.
+
+What it does (high-level)
+-------------------------
+A) Builds a modelling table at "base" sample level:
+   - y_true (truth from metadata.tsv)
+   - candidate metrics (mapped HQ reads, breadth, RPM, gene depth, BLAST identity, etc.)
+B) Exploratory plots:
+   - distribution by truth class, correlation heatmap, and per-metric ROC/PR curves
+C) Statistical support:
+   - permutation test for AUC (per metric and selected combined model)
+   - bootstrap confidence intervals for AUC, AP, F1, recall, specificity, and precision
+   - Bayesian posterior distributions for sensitivity/specificity/PPV/NPV at chosen threshold
+D) Threshold selection:
+   - compares *single-metric* thresholds vs *multi-metric* rules
+   - selects the best approach by:
+       1) maximize F1
+       2) tie-break: higher recall
+       3) tie-break: higher specificity
+       4) tie-break: simpler model (fewer metrics)
+E) Saves:
+   - results/thresholds.json (final rule + numbers)
+   - results/metrics_table.tsv (modelling table)
+   - results/per_metric_performance.tsv
+   - results/model_comparison.tsv
+   - results/figures/*.png (publication-ready)
+
+No sklearn dependency
+---------------------
+This script avoids scikit-learn to keep it lightweight and consistent with your ROC code style.
+(Uses numpy/pandas/matplotlib only.)
 """
 
+from __future__ import annotations
+
 import argparse
-import os
+import json
+import math
 import re
-import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# ----------------------------
-# sample name canonicalization (matches your style)
-# ----------------------------
+# -----------------------------
+# canonical sample naming (match your pipeline style)
+# -----------------------------
 _SUFFIX_PATTERNS = [
     r"(?:_R?[12](?:_00[1-9])?)$",
     r"(?:_[12])$",
@@ -43,7 +101,11 @@ _SUFFIX_PATTERNS = [
 
 
 def canonical_sample(name: str) -> str:
-    s = name
+    """
+    Convert a filename-ish sample string into a stable "base" sample name.
+    Repeatedly strips common suffix patterns until nothing else can be removed.
+    """
+    s = str(name)
     changed = True
     while changed:
         changed = False
@@ -55,12 +117,236 @@ def canonical_sample(name: str) -> str:
     return s.rstrip("_-")
 
 
-# ----------------------------
-# basic metrics helpers
-# ----------------------------
-def confusion_counts(y_true, y_pred):
-    y_true = np.asarray(y_true).astype(int)
-    y_pred = np.asarray(y_pred).astype(int)
+# -----------------------------
+# IO helpers
+# -----------------------------
+def die(msg: str) -> None:
+    print(f"❌ {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    """
+    Robust CSV/TSV reader with auto separator and safe dtype handling.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    for sep in [",", "\t"]:
+        try:
+            df = pd.read_csv(path, sep=sep, low_memory=False)
+            if df.shape[1] >= 2:
+                return df
+        except Exception:
+            pass
+    try:
+        return pd.read_csv(path, sep=None, engine="python", low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def read_glob(paths: Sequence[Path]) -> pd.DataFrame:
+    dfs = []
+    for p in paths:
+        df = read_table(p)
+        if df is not None and not df.empty:
+            dfs.append(df)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+# -----------------------------
+# metric extraction from your outputs
+# -----------------------------
+def load_alignment_summaries(csv_dirs: List[Path]) -> pd.DataFrame:
+    """
+    Load cmv_alignment_summary.csv if present, otherwise *_summary.csv.
+    Expects the samtools-derived columns used in cmv_pipeline_gui.py.
+    """
+    files = []
+    for d in csv_dirs:
+        if not d.exists():
+            continue
+        p = d / "cmv_alignment_summary.csv"
+        if p.exists():
+            files.append(p)
+        else:
+            files.extend(sorted(d.glob("*_summary.csv")))
+            files.extend(sorted(d.glob("summary.csv")))
+    df = read_glob(files)
+    if df.empty:
+        return df
+
+    if "base" not in df.columns:
+        if "sample" in df.columns:
+            df["base"] = df["sample"].astype(str).apply(canonical_sample)
+        else:
+            guess = df.columns[0]
+            df["base"] = df[guess].astype(str).apply(canonical_sample)
+
+    df["base"] = df["base"].astype(str).apply(canonical_sample)
+
+    numeric_cols = [
+        "cmv_mapped_reads_mapq",
+        "cmv_rpm_mapq",
+        "cmv_breadth_mapq",
+        "cmv_cov_bases_mapq",
+        "cmv_ref_bases",
+        "total_reads_in_cmv_bam",
+    ]
+    df = coerce_numeric(df, numeric_cols)
+
+    agg = {"cmv_mapped_reads_mapq": "sum",
+           "cmv_cov_bases_mapq": "sum",
+           "total_reads_in_cmv_bam": "sum",
+           "cmv_rpm_mapq": "max",
+           "cmv_breadth_mapq": "max",
+           "cmv_ref_bases": "max"}
+    for k in list(agg.keys()):
+        if k not in df.columns:
+            agg.pop(k, None)
+
+    out = df.groupby("base", as_index=False).agg(agg) if agg else df[["base"]].drop_duplicates()
+    return out
+
+
+def load_gene_metrics(csv_dirs: List[Path]) -> pd.DataFrame:
+    """
+    Load *_gene.csv outputs and summarise to base-level metrics.
+    """
+    files = []
+    for d in csv_dirs:
+        if d.exists():
+            files.extend(sorted(d.glob("*_gene.csv")))
+    df = read_glob(files)
+    if df.empty:
+        return df
+
+    if "base" not in df.columns:
+        if "sample" in df.columns:
+            df["base"] = df["sample"].astype(str).apply(canonical_sample)
+        else:
+            die("Gene table missing 'base' and 'sample' columns.")
+
+    df["base"] = df["base"].astype(str).apply(canonical_sample)
+    df = coerce_numeric(df, ["avg_depth", "breadth"])
+
+    g = df.groupby("base")
+    base_df = pd.DataFrame({
+        "base": list(g.groups.keys()),
+        "gene_mean_depth": g["avg_depth"].mean().values,
+        "gene_median_depth": g["avg_depth"].median().values,
+        "gene_min_depth": g["avg_depth"].min().values,
+        "gene_mean_breadth": g["breadth"].mean().values,
+        "gene_min_breadth": g["breadth"].min().values,
+        "n_genes_reported": g.size().values,
+    })
+
+    def gene_val(gene: str, col: str) -> pd.Series:
+        sub = df[df["gene"].astype(str).str.upper() == gene.upper()]
+        if sub.empty:
+            return pd.Series(index=base_df["base"], data=np.nan)
+        return sub.groupby("base")[col].mean()
+
+    for gene in ["UL97", "UL54", "IE1", "UL83"]:
+        s = gene_val(gene, "avg_depth")
+        base_df[f"{gene}_mean_depth"] = base_df["base"].map(s).astype(float)
+
+    return base_df
+
+
+def load_blast_top5(csv_dirs: List[Path]) -> pd.DataFrame:
+    """
+    Load *_blast_top5.csv outputs and compute CMV-focused identity stats per base.
+    """
+    files = []
+    for d in csv_dirs:
+        if d.exists():
+            files.extend(sorted(d.glob("*_blast_top5.csv")))
+    df = read_glob(files)
+    if df.empty:
+        return df
+
+    if "base" not in df.columns:
+        if "sample" in df.columns:
+            df["base"] = df["sample"].astype(str).apply(canonical_sample)
+        else:
+            die("BLAST top5 table missing 'base' and 'sample' columns.")
+
+    df["base"] = df["base"].astype(str).apply(canonical_sample)
+    df = coerce_numeric(df, ["total_hits", "avg_identity"])
+
+    species = df["species"].astype(str) if "species" in df.columns else pd.Series("", index=df.index)
+    is_cmv = species.str.contains("herpesvirus 5|cytomegalovirus|merlin|hcmv", case=False, na=False)
+
+    out = []
+    for b, sub in df.groupby("base"):
+        cmv_sub = sub[is_cmv.loc[sub.index]]
+        if cmv_sub.empty:
+            out.append({"base": b, "blast_cmv_mean_identity_top5": np.nan,
+                        "blast_cmv_hits_top5": 0,
+                        "blast_any_hits_top5": int(sub["total_hits"].sum()) if "total_hits" in sub else np.nan})
+        else:
+            if "total_hits" in cmv_sub.columns and cmv_sub["total_hits"].sum() > 0:
+                w = cmv_sub["total_hits"].values
+                mu = float(np.average(cmv_sub["avg_identity"].values, weights=w))
+                hits = int(cmv_sub["total_hits"].sum())
+            else:
+                mu = float(cmv_sub["avg_identity"].mean())
+                hits = int(cmv_sub.shape[0])
+            out.append({"base": b, "blast_cmv_mean_identity_top5": mu,
+                        "blast_cmv_hits_top5": hits,
+                        "blast_any_hits_top5": int(sub["total_hits"].sum()) if "total_hits" in sub else np.nan})
+    return pd.DataFrame(out)
+
+
+def load_truth(metadata_tsv: Path) -> pd.DataFrame:
+    df = read_table(metadata_tsv)
+    if df.empty:
+        die(f"Truth metadata empty or unreadable: {metadata_tsv}")
+    required = ["sample", "truth_cmv_present"]
+    for r in required:
+        if r not in df.columns:
+            die(f"Truth metadata missing required column '{r}'")
+    df["base"] = df["sample"].astype(str).apply(canonical_sample)
+    df["y_true"] = pd.to_numeric(df["truth_cmv_present"], errors="coerce").fillna(0).astype(int)
+    keep = ["base", "y_true"]
+    for c in ["group", "cmv_fraction_target", "total_pairs"]:
+        if c in df.columns:
+            keep.append(c)
+    out = df[keep].drop_duplicates("base")
+    return out
+
+
+# -----------------------------
+# metrics + scoring
+# -----------------------------
+@dataclass
+class Perf:
+    threshold: float
+    tp: int
+    tn: int
+    fp: int
+    fn: int
+    precision: float
+    recall: float
+    specificity: float
+    f1: float
+
+
+def confusion_from_pred(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int, int, int, int]:
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
     tp = int(((y_true == 1) & (y_pred == 1)).sum())
     tn = int(((y_true == 0) & (y_pred == 0)).sum())
     fp = int(((y_true == 0) & (y_pred == 1)).sum())
@@ -68,987 +354,778 @@ def confusion_counts(y_true, y_pred):
     return tp, tn, fp, fn
 
 
-def safe_div(a, b):
-    return float(a) / float(b) if b else float("nan")
+def safe_div(a: float, b: float) -> float:
+    return float(a / b) if b else 0.0
 
 
-def metrics_from_counts(tp, tn, fp, fn):
-    sens = safe_div(tp, tp + fn)          # recall / TPR
-    spec = safe_div(tn, tn + fp)          # TNR
-    prec = safe_div(tp, tp + fp)          # PPV
-    f1 = safe_div(2 * tp, 2 * tp + fp + fn)
-    fpr = safe_div(fp, fp + tn)
-    acc = safe_div(tp + tn, tp + tn + fp + fn)
-    youden = sens + spec - 1 if (not np.isnan(sens) and not np.isnan(spec)) else float("nan")
-    return sens, spec, prec, f1, fpr, acc, youden
+def perf_from_threshold(y_true: np.ndarray, x: np.ndarray, thr: float, direction: str = "ge") -> Perf:
+    if direction == "ge":
+        y_pred = (x >= thr).astype(int)
+    else:
+        y_pred = (x <= thr).astype(int)
+    tp, tn, fp, fn = confusion_from_pred(y_true, y_pred)
+    prec = safe_div(tp, tp + fp)
+    rec = safe_div(tp, tp + fn)
+    spec = safe_div(tn, tn + fp)
+    f1 = safe_div(2 * prec * rec, prec + rec) if (prec + rec) else 0.0
+    return Perf(threshold=float(thr), tp=tp, tn=tn, fp=fp, fn=fn,
+                precision=prec, recall=rec, specificity=spec, f1=f1)
 
 
-# ----------------------------
-# ROC / AUC (no sklearn)
-# ----------------------------
-def roc_auc_rank(y_true: np.ndarray, scores: np.ndarray) -> float:
-    """AUC via rank/Mann–Whitney. Robust, no sklearn."""
-    y_true = np.asarray(y_true).astype(int)
-    scores = np.asarray(scores).astype(float)
-
-    pos = scores[y_true == 1]
-    neg = scores[y_true == 0]
-    if len(pos) == 0 or len(neg) == 0:
-        return float("nan")
-
-    order = np.argsort(scores)
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(1, len(scores) + 1)
-
-    # average ranks for ties
-    uniq, inv, counts = np.unique(scores, return_inverse=True, return_counts=True)
-    for uidx, cnt in enumerate(counts):
-        if cnt > 1:
-            idxs = np.where(inv == uidx)[0]
-            ranks[idxs] = ranks[idxs].mean()
-
-    sum_ranks_pos = ranks[y_true == 1].sum()
-    n_pos = len(pos)
-    n_neg = len(neg)
-    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-    return float(auc)
+def roc_curve_points(y_true: np.ndarray, scores: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y_true = y_true.astype(int)
+    m = np.isfinite(scores)
+    y = y_true[m]
+    s = scores[m]
+    thrs = np.unique(s)[::-1]
+    thrs = np.r_[np.inf, thrs, -np.inf]
+    tpr = []
+    fpr = []
+    for thr in thrs:
+        y_pred = (s >= thr).astype(int)
+        tp, tn, fp, fn = confusion_from_pred(y, y_pred)
+        tpr.append(safe_div(tp, tp + fn))
+        fpr.append(safe_div(fp, fp + tn))
+    return np.array(fpr), np.array(tpr), thrs
 
 
-def roc_points_from_scores(y_true: np.ndarray, scores: np.ndarray):
-    """ROC curve by thresholding scores (>= t). Returns array with columns: FPR, TPR, threshold."""
-    y_true = np.asarray(y_true).astype(int)
-    scores = np.asarray(scores).astype(float)
-
-    ts = np.unique(scores)
-    ts = np.sort(ts)
-    ts = np.concatenate(([ts[0] - 1e-9], ts, [ts[-1] + 1e-9]))
-
-    pts = []
-    for t in ts:
-        y_pred = (scores >= t).astype(int)
-        tp, tn, fp, fn = confusion_counts(y_true, y_pred)
-        sens, spec, prec, f1, fpr, acc, youden = metrics_from_counts(tp, tn, fp, fn)
-        pts.append((fpr, sens, t))
-    pts = np.array(pts, dtype=float)
-    pts = pts[np.argsort(pts[:, 0])]
-    return pts
+def pr_curve_points(y_true: np.ndarray, scores: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y_true = y_true.astype(int)
+    m = np.isfinite(scores)
+    y = y_true[m]
+    s = scores[m]
+    thrs = np.unique(s)[::-1]
+    thrs = np.r_[np.inf, thrs, -np.inf]
+    precs = []
+    recs = []
+    for thr in thrs:
+        y_pred = (s >= thr).astype(int)
+        tp, tn, fp, fn = confusion_from_pred(y, y_pred)
+        precs.append(safe_div(tp, tp + fp))
+        recs.append(safe_div(tp, tp + fn))
+    return np.array(recs), np.array(precs), thrs
 
 
-# ----------------------------
-# PR curve + Average Precision (no sklearn)
-# ----------------------------
-def pr_points_from_scores(y_true: np.ndarray, scores: np.ndarray):
-    """
-    PR curve by thresholding scores (>= t).
-    Returns arrays: recall, precision, threshold sorted by recall ascending for plotting.
-    """
-    y_true = np.asarray(y_true).astype(int)
-    scores = np.asarray(scores).astype(float)
-
-    ts = np.unique(scores)
-    ts = np.sort(ts)
-    ts = np.concatenate(([ts[0] - 1e-9], ts, [ts[-1] + 1e-9]))
-
-    rows = []
-    for t in ts:
-        y_pred = (scores >= t).astype(int)
-        tp, tn, fp, fn = confusion_counts(y_true, y_pred)
-        sens, spec, prec, f1, fpr, acc, youden = metrics_from_counts(tp, tn, fp, fn)
-        # sens = recall
-        rows.append((sens, prec, t))
-    arr = np.array(rows, dtype=float)
-
-    # For PR plotting it's common to sort by recall
-    arr = arr[np.argsort(arr[:, 0])]
-    recall = arr[:, 0]
-    precision = arr[:, 1]
-    threshold = arr[:, 2]
-    return recall, precision, threshold
+def auc_trapz(x: np.ndarray, y: np.ndarray) -> float:
+    idx = np.argsort(x)
+    xs = x[idx]
+    ys = y[idx]
+    return float(np.trapezoid(ys, xs))
 
 
 def average_precision(y_true: np.ndarray, scores: np.ndarray) -> float:
-    """
-    Average Precision (AP) computed like sklearn's definition:
-      sort by score desc, then sum over recall increases: AP = Σ (Δrecall * precision_at_step)
-    """
-    y_true = np.asarray(y_true).astype(int)
-    scores = np.asarray(scores).astype(float)
-
-    n_pos = int((y_true == 1).sum())
-    if n_pos == 0:
-        return float("nan")
-
-    order = np.argsort(-scores)  # descending
-    y_sorted = y_true[order]
-
-    tp = 0
-    fp = 0
-    prev_recall = 0.0
-    ap = 0.0
-
-    # Walk down ranked list; every item is a threshold step
-    for i in range(len(y_sorted)):
-        if y_sorted[i] == 1:
-            tp += 1
-        else:
-            fp += 1
-
-        recall = tp / n_pos
-        precision = tp / (tp + fp) if (tp + fp) else 1.0
-
-        # Only add when recall increases (i.e. at positives)
-        if y_sorted[i] == 1:
-            ap += (recall - prev_recall) * precision
-            prev_recall = recall
-
-    return float(ap)
+    r, p, _ = pr_curve_points(y_true, scores)
+    idx = np.argsort(r)
+    return float(np.trapezoid(p[idx], r[idx]))
 
 
-# ----------------------------
-# samtools helpers
-# ----------------------------
-def run_cmd(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed:\n  {' '.join(cmd)}\n\nSTDERR:\n{p.stderr}")
-    return p.stdout
+def permutation_test_auc(y_true: np.ndarray, scores: np.ndarray, n_perm: int, rng: np.random.Generator) -> Tuple[float, float, np.ndarray]:
+    fpr, tpr, _ = roc_curve_points(y_true, scores)
+    obs = auc_trapz(fpr, tpr)
+
+    perms = np.zeros(n_perm, dtype=float)
+    y = y_true.copy().astype(int)
+    for i in range(n_perm):
+        rng.shuffle(y)
+        fpr_p, tpr_p, _ = roc_curve_points(y, scores)
+        perms[i] = auc_trapz(fpr_p, tpr_p)
+
+    dist = np.abs(perms - 0.5)
+    pval = (np.sum(dist >= abs(obs - 0.5)) + 1) / (n_perm + 1)
+    return obs, float(pval), perms
 
 
-def samtools_count(bam: Path, mapped_only=False, mapq=None) -> int:
-    cmd = ["samtools", "view", "-c"]
-    if mapped_only:
-        cmd += ["-F", "4"]
-    if mapq is not None:
-        cmd += ["-q", str(int(mapq))]
-    cmd += [str(bam)]
-    out = run_cmd(cmd).strip()
-    return int(out) if out else 0
-
-
-def samtools_idxstats_lengths_and_mapped(bam: Path):
-    out = run_cmd(["samtools", "idxstats", str(bam)])
-    genome_len = 0
-    mapped_sum = 0
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        contig, length, mapped = parts[0], parts[1], parts[2]
-        if contig == "*":
-            continue
-        try:
-            L = int(length)
-            M = int(mapped)
-        except ValueError:
-            continue
-        genome_len += L
-        mapped_sum += M
-    return genome_len, mapped_sum
-
-
-def breadth_of_coverage(bam: Path, mapq: int, depth_min: int = 1, method: str = "coverage"):
-    """
-    Breadth = covered_bases / reference_length.
-    method:
-      - "coverage": uses `samtools coverage` if available (fast)
-      - "depth": uses `samtools depth -a` (slower but widely available)
-    """
-    genome_len, _ = samtools_idxstats_lengths_and_mapped(bam)
-    if genome_len <= 0:
-        return float("nan"), 0, 0
-
-    if method == "coverage":
-        try:
-            out = run_cmd(["samtools", "coverage", "-q", str(int(mapq)), str(bam)])
-            covbases_sum = 0
-            len_sum = 0
-            for line in out.splitlines():
-                if not line or line.startswith("#") or line.lower().startswith("rname"):
-                    continue
-                parts = line.split()
-                if len(parts) < 6:
-                    continue
-                rname = parts[0]
-                if rname == "*":
-                    continue
-                start = int(parts[1])
-                end = int(parts[2])
-                covbases = int(parts[4])
-                length = end - start + 1
-                covbases_sum += covbases
-                len_sum += length
-            if len_sum > 0:
-                return covbases_sum / len_sum, covbases_sum, len_sum
-        except Exception:
-            method = "depth"
-
-    out = run_cmd(["samtools", "depth", "-a", "-q", str(int(mapq)), str(bam)])
-    covered = 0
-    total = 0
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        try:
-            d = int(parts[2])
-        except ValueError:
-            continue
-        total += 1
-        if d >= depth_min:
-            covered += 1
-
-    if total == 0:
-        return float("nan"), 0, 0
-    return covered / total, covered, total
-
-
-# ----------------------------
-# IO helpers
-# ----------------------------
-def load_truth(truth_path: Path) -> pd.DataFrame:
-    """
-    Needs columns:
-      sample, truth_cmv_present  (or cmv_present)
-    """
-    df = pd.read_csv(truth_path, sep="\t")
-    if "sample" not in df.columns:
-        raise ValueError("Truth TSV must contain a 'sample' column.")
-    df["base"] = df["sample"].astype(str).apply(canonical_sample)
-
-    if "truth_cmv_present" in df.columns:
-        y = df["truth_cmv_present"]
-    elif "cmv_present" in df.columns:
-        y = df["cmv_present"]
-    else:
-        raise ValueError("Truth TSV must contain 'truth_cmv_present' or 'cmv_present' column.")
-
-    df["truth_cmv_present"] = pd.to_numeric(y, errors="coerce").fillna(0).astype(int)
-    df = df.sort_values("base").drop_duplicates("base", keep="first").reset_index(drop=True)
-    return df[["base", "truth_cmv_present"]]
-
-
-def find_bams(cmv_bam_dir: Path):
-    bams = sorted([p for p in cmv_bam_dir.glob("*.bam") if not str(p).endswith(".bai")])
-    if not bams:
-        raise FileNotFoundError(f"No .bam files found in: {cmv_bam_dir}")
-    return bams
-
-
-def pick_score(df: pd.DataFrame, metric: str):
-    if metric == "mapped_hq":
-        return df["cmv_mapped_reads_mapq"].to_numpy(dtype=float)
-    if metric == "rpm_hq":
-        return df["cmv_rpm_mapq"].to_numpy(dtype=float)
-    if metric == "breadth":
-        return df["cmv_breadth_mapq"].to_numpy(dtype=float)
-    if metric == "cov_bases":
-        return df["cmv_cov_bases_mapq"].to_numpy(dtype=float)
-    if metric == "combo":
-        # simple combined score: log1p(mapped) + 10*breadth
-        return np.log1p(df["cmv_mapped_reads_mapq"].to_numpy(dtype=float)) + 10.0 * df["cmv_breadth_mapq"].to_numpy(dtype=float)
-    raise ValueError(f"Unknown metric: {metric}")
-
-
-# ----------------------------
-# threshold selection (1D)
-# ----------------------------
-def threshold_scan_1d(y: np.ndarray, scores: np.ndarray):
-    thresholds = np.unique(scores)
-    thresholds = np.sort(np.concatenate([thresholds, thresholds + 1e-12]))
-    rows = []
-    for t in thresholds:
-        y_pred = (scores >= t).astype(int)
-        tp, tn, fp, fn = confusion_counts(y, y_pred)
-        sens, spec, prec, f1, fpr, acc, youden = metrics_from_counts(tp, tn, fp, fn)
-        rows.append({
-            "threshold_score": float(t),
-            "TP": tp, "TN": tn, "FP": fp, "FN": fn,
-            "sensitivity": sens,
-            "specificity": spec,
-            "precision": prec,
-            "F1": f1,
-            "FPR": fpr,
-            "accuracy": acc,
-            "youden_J": youden,
-        })
-    perf = pd.DataFrame(rows).sort_values("threshold_score").reset_index(drop=True)
-    return perf
-
-
-def select_threshold_1d(perf: pd.DataFrame, rule: str, min_sensitivity: float, max_fpr: float):
-    best = None
-    if rule == "youden":
-        # Maximise Youden; tie-breaker: prefer LOWER threshold (more permissive) if identical
-        perf2 = perf.copy()
-        perf2["youden_J_filled"] = perf2["youden_J"].fillna(-1e18)
-        best_score = perf2["youden_J_filled"].max()
-        candidates = perf2[perf2["youden_J_filled"] == best_score]
-        if not candidates.empty:
-            best = candidates.sort_values("threshold_score", ascending=True).iloc[0].to_dict()
-        return best
-
-    if rule == "minscore_sens_fpr":
-        feas = perf[(perf["sensitivity"] >= min_sensitivity) & (perf["FPR"] <= max_fpr)]
-        if feas.empty:
-            return None
-        # choose smallest threshold meeting constraints
-        best = feas.sort_values("threshold_score", ascending=True).iloc[0].to_dict()
-        return best
-
-    raise ValueError(f"Unknown rule: {rule}")
-
-
-# ----------------------------
-# bootstrap CIs
-# ----------------------------
-def percentile_ci(x, alpha=0.05):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return (float("nan"), float("nan"))
-    lo = np.percentile(x, 100 * (alpha / 2))
-    hi = np.percentile(x, 100 * (1 - alpha / 2))
-    return float(lo), float(hi)
-
-
-def bootstrap_summary(y, scores, rule, min_sens, max_fpr, n_boot=2000, seed=1):
-    """
-    Returns dict with bootstrap arrays and CIs for:
-      - AUC
-      - AP
-      - selected threshold
-      - sens/spec/prec/F1 at selected threshold
-    """
-    rng = np.random.default_rng(seed)
-    n = len(y)
-
-    aucs, aps, ths = [], [], []
-    senss, specs, precs, f1s, fprs = [], [], [], [], []
-    skipped = 0
+def bootstrap_ci_metric(y_true: np.ndarray, scores: np.ndarray, thr: float, n_boot: int,
+                        rng: np.random.Generator) -> Dict[str, Tuple[float, float]]:
+    y_true = y_true.astype(int)
+    n = len(y_true)
+    stats = {"auc": [], "ap": [], "f1": [], "recall": [], "specificity": [], "precision": []}
+    idx = np.arange(n)
 
     for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        yb = y[idx]
-        sb = scores[idx]
-
-        # Need at least one pos and one neg for ROC AUC
-        if (yb == 1).sum() == 0 or (yb == 0).sum() == 0:
-            skipped += 1
+        b = rng.choice(idx, size=n, replace=True)
+        yb = y_true[b]
+        sb = scores[b]
+        if len(np.unique(yb[np.isfinite(sb)])) < 2:
             continue
+        fpr, tpr, _ = roc_curve_points(yb, sb)
+        stats["auc"].append(auc_trapz(fpr, tpr))
+        stats["ap"].append(average_precision(yb, sb))
+        perf = perf_from_threshold(yb, sb, thr, direction="ge")
+        stats["f1"].append(perf.f1)
+        stats["recall"].append(perf.recall)
+        stats["specificity"].append(perf.specificity)
+        stats["precision"].append(perf.precision)
 
-        aucs.append(roc_auc_rank(yb, sb))
-        aps.append(average_precision(yb, sb))
-
-        perf = threshold_scan_1d(yb, sb)
-        best = select_threshold_1d(perf, rule, min_sens, max_fpr)
-        if best is None:
-            ths.append(float("nan"))
-            senss.append(float("nan"))
-            specs.append(float("nan"))
-            precs.append(float("nan"))
-            f1s.append(float("nan"))
-            fprs.append(float("nan"))
+    out = {}
+    for k, vals in stats.items():
+        if not vals:
+            out[k] = (np.nan, np.nan)
         else:
-            ths.append(float(best["threshold_score"]))
-            senss.append(float(best["sensitivity"]))
-            specs.append(float(best["specificity"]))
-            precs.append(float(best["precision"]))
-            f1s.append(float(best["F1"]))
-            fprs.append(float(best["FPR"]))
-
-    out = {
-        "aucs": np.asarray(aucs, dtype=float),
-        "aps": np.asarray(aps, dtype=float),
-        "ths": np.asarray(ths, dtype=float),
-        "sens": np.asarray(senss, dtype=float),
-        "spec": np.asarray(specs, dtype=float),
-        "prec": np.asarray(precs, dtype=float),
-        "f1": np.asarray(f1s, dtype=float),
-        "fpr": np.asarray(fprs, dtype=float),
-        "skipped": skipped,
-    }
-
-    out["auc_ci95"] = percentile_ci(out["aucs"])
-    out["ap_ci95"] = percentile_ci(out["aps"])
-    out["th_ci95"] = percentile_ci(out["ths"])
-    out["sens_ci95"] = percentile_ci(out["sens"])
-    out["spec_ci95"] = percentile_ci(out["spec"])
-    out["prec_ci95"] = percentile_ci(out["prec"])
-    out["f1_ci95"] = percentile_ci(out["f1"])
-    out["fpr_ci95"] = percentile_ci(out["fpr"])
+            lo, hi = np.percentile(vals, [2.5, 97.5])
+            out[k] = (float(lo), float(hi))
     return out
 
 
-# ----------------------------
-# 2D threshold search
-# ----------------------------
-def threshold_scan_2d(y, mapped_hq, second, second_name: str):
-    """
-    Scan all threshold pairs:
-      pred = (mapped_hq >= Tm) AND (second >= Ts)
-    Returns dataframe with Tm, Ts and metrics.
-    """
-    y = np.asarray(y).astype(int)
-    mapped_hq = np.asarray(mapped_hq).astype(float)
-    second = np.asarray(second).astype(float)
-
-    t_m = np.sort(np.unique(mapped_hq))
-    t_s = np.sort(np.unique(second))
-
-    rows = []
-    for tm in t_m:
-        for ts in t_s:
-            y_pred = ((mapped_hq >= tm) & (second >= ts)).astype(int)
-            tp, tn, fp, fn = confusion_counts(y, y_pred)
-            sens, spec, prec, f1, fpr, acc, youden = metrics_from_counts(tp, tn, fp, fn)
-            rows.append({
-                "Tm_mapped_hq": float(tm),
-                f"Ts_{second_name}": float(ts),
-                "TP": tp, "TN": tn, "FP": fp, "FN": fn,
-                "sensitivity": sens,
-                "specificity": spec,
-                "precision": prec,
-                "F1": f1,
-                "FPR": fpr,
-                "accuracy": acc,
-                "youden_J": youden,
-            })
-    df = pd.DataFrame(rows)
-    return df, t_m, t_s
+def beta_posterior(a0: float, b0: float, successes: int, failures: int) -> Tuple[float, float]:
+    return a0 + successes, b0 + failures
 
 
-def select_threshold_2d(scan2d: pd.DataFrame, rule: str, min_sens: float, max_fpr: float, second_name: str):
-    if scan2d.empty:
-        return None
-
-    if rule == "youden":
-        s = scan2d["youden_J"].fillna(-1e18)
-        best = scan2d.loc[s.idxmax()].to_dict()
-        return best
-
-    if rule == "max_f1":
-        s = scan2d["F1"].fillna(-1e18)
-        best = scan2d.loc[s.idxmax()].to_dict()
-        return best
-
-    if rule == "minscore_sens_fpr":
-        feas = scan2d[(scan2d["sensitivity"] >= min_sens) & (scan2d["FPR"] <= max_fpr)]
-        if feas.empty:
-            return None
-        # lexicographic: smallest mapped threshold, then smallest second threshold
-        cols = ["Tm_mapped_hq", f"Ts_{second_name}"]
-        best = feas.sort_values(cols, ascending=True).iloc[0].to_dict()
-        return best
-
-    raise ValueError(f"Unknown 2D rule: {rule}")
+def beta_pdf_grid(a: float, b: float, grid: np.ndarray) -> np.ndarray:
+    import math
+    lgamma = math.lgamma
+    logB = lgamma(a) + lgamma(b) - lgamma(a + b)
+    x = np.clip(grid, 1e-12, 1 - 1e-12)
+    return np.exp((a - 1) * np.log(x) + (b - 1) * np.log(1 - x) - logB)
 
 
-# ----------------------------
-# plotting helpers (well-labeled)
-# ----------------------------
-def save_roc_plot(path: Path, roc_pts, auc, auc_ci, metric, n_pos, n_neg, p_perm=None):
-    plt.figure(figsize=(6.2, 5.2))
-    plt.plot(roc_pts[:, 0], roc_pts[:, 1], label="ROC curve")
-    plt.plot([0, 1], [0, 1], linestyle="--", label="Chance (AUC=0.5)")
-    plt.xlabel("False Positive Rate (1 - Specificity)")
-    plt.ylabel("True Positive Rate (Sensitivity)")
-    title = f"ROC curve (score = {metric})\nAUC = {auc:.3f} (95% CI {auc_ci[0]:.3f}–{auc_ci[1]:.3f})"
-    if p_perm is not None and np.isfinite(p_perm):
-        title += f" | Permutation p = {p_perm:.3g}"
+# -----------------------------
+# combined models
+# -----------------------------
+@dataclass
+class Rule:
+    name: str
+    metrics: List[str]
+    thresholds: Dict[str, float]
+    requirement: str  # "all" or "kofn"
+    k: int = 0
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        rows = []
+        for m in self.metrics:
+            x = df[m].to_numpy(dtype=float)
+            thr = float(self.thresholds[m])
+            rows.append((x >= thr).astype(int))
+        if not rows:
+            return np.zeros(len(df), dtype=int)
+        M = np.vstack(rows)
+        if self.requirement == "all":
+            return (M.sum(axis=0) == len(self.metrics)).astype(int)
+        if self.requirement == "kofn":
+            return (M.sum(axis=0) >= int(self.k)).astype(int)
+        raise ValueError(f"Unknown requirement: {self.requirement}")
+
+    def score_as_float(self, df: pd.DataFrame) -> np.ndarray:
+        rows = []
+        for m in self.metrics:
+            x = df[m].to_numpy(dtype=float)
+            thr = float(self.thresholds[m])
+            rows.append((x >= thr).astype(float))
+        if not rows:
+            return np.zeros(len(df), dtype=float)
+        return np.vstack(rows).mean(axis=0)
+
+
+def pick_candidate_thresholds(x: np.ndarray, n_grid: int = 40) -> np.ndarray:
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.array([np.nan])
+    qs = np.linspace(0.0, 1.0, n_grid)
+    thrs = np.unique(np.quantile(x, qs))
+    return thrs
+
+
+def choose_best_single_metric(df: pd.DataFrame, y_true: np.ndarray, metric: str) -> Tuple[Perf, float, float, float]:
+    x = df[metric].to_numpy(dtype=float)
+    thrs = pick_candidate_thresholds(x, n_grid=60)
+
+    best: Optional[Perf] = None
+    for thr in thrs:
+        perf = perf_from_threshold(y_true, x, thr, "ge")
+        if best is None:
+            best = perf
+            continue
+        if (perf.f1 > best.f1) or (perf.f1 == best.f1 and perf.recall > best.recall) or \
+           (perf.f1 == best.f1 and perf.recall == best.recall and perf.specificity > best.specificity):
+            best = perf
+
+    fpr, tpr, _ = roc_curve_points(y_true, x)
+    auc = auc_trapz(fpr, tpr)
+    ap = average_precision(y_true, x)
+    return best, float(auc), float(ap), float(best.threshold)
+
+
+def choose_best_rule(df: pd.DataFrame, y_true: np.ndarray, metrics: List[str],
+                     requirement: str, k: int = 0) -> Tuple[Rule, Perf, float, float]:
+    grids = {}
+    for m in metrics:
+        grids[m] = pick_candidate_thresholds(df[m].to_numpy(dtype=float), n_grid=30)
+
+    keys = list(metrics)
+    arrays = [grids[k] for k in keys]
+    if any((a.size == 0 or (a.size == 1 and not np.isfinite(a[0]))) for a in arrays):
+        r = Rule(name="invalid", metrics=metrics, thresholds={m: np.nan for m in metrics}, requirement=requirement, k=k)
+        return r, Perf(np.nan, 0, 0, 0, 0, 0, 0, 0, 0), np.nan, np.nan
+
+    best_rule: Optional[Rule] = None
+    best_perf: Optional[Perf] = None
+
+    lens = [len(a) for a in arrays]
+    total = int(np.prod(lens))
+    for flat in range(total):
+        idxs = []
+        rem = flat
+        for L in reversed(lens):
+            idxs.append(rem % L)
+            rem //= L
+        idxs = list(reversed(idxs))
+        thresholds = {keys[i]: float(arrays[i][idxs[i]]) for i in range(len(keys))}
+        rule = Rule(
+            name=f"{requirement.upper()}_{len(metrics)}m",
+            metrics=metrics,
+            thresholds=thresholds,
+            requirement=requirement,
+            k=k,
+        )
+        y_pred = rule.predict(df)
+        tp, tn, fp, fn = confusion_from_pred(y_true, y_pred)
+        prec = safe_div(tp, tp + fp)
+        rec = safe_div(tp, tp + fn)
+        spec = safe_div(tn, tn + fp)
+        f1 = safe_div(2 * prec * rec, prec + rec) if (prec + rec) else 0.0
+        perf = Perf(threshold=np.nan, tp=tp, tn=tn, fp=fp, fn=fn, precision=prec, recall=rec, specificity=spec, f1=f1)
+
+        if best_perf is None:
+            best_perf = perf
+            best_rule = rule
+            continue
+
+        if (perf.f1 > best_perf.f1) or \
+           (perf.f1 == best_perf.f1 and perf.recall > best_perf.recall) or \
+           (perf.f1 == best_perf.f1 and perf.recall == best_perf.recall and perf.specificity > best_perf.specificity) or \
+           (perf.f1 == best_perf.f1 and perf.recall == best_perf.recall and perf.specificity == best_perf.specificity and perf.fp < best_perf.fp):
+            best_perf = perf
+            best_rule = rule
+
+    score = best_rule.score_as_float(df) if best_rule else np.zeros(len(df))
+    fpr, tpr, _ = roc_curve_points(y_true, score)
+    auc = auc_trapz(fpr, tpr)
+    ap = average_precision(y_true, score)
+    return best_rule, best_perf, float(auc), float(ap)
+
+
+# -----------------------------
+# plotting helpers (matplotlib-only)
+# -----------------------------
+def savefig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(path, dpi=320)
+    plt.close()
+
+
+def plot_metric_distributions(df: pd.DataFrame, y: np.ndarray, metric: str, out: Path) -> None:
+    x = df[metric].to_numpy(dtype=float)
+    pos = x[y == 1]
+    neg = x[y == 0]
+
+    plt.figure(figsize=(7, 4))
+    plt.hist(neg[np.isfinite(neg)], bins=40, alpha=0.7, label="Truth negative")
+    plt.hist(pos[np.isfinite(pos)], bins=40, alpha=0.7, label="Truth positive")
+    plt.xlabel(metric)
+    plt.ylabel("Count")
+    plt.title(f"Distribution of {metric} by truth class")
+    plt.legend()
+    savefig(out)
+
+
+def plot_roc_pr(y: np.ndarray, scores: np.ndarray, title: str, out_roc: Path, out_pr: Path) -> Tuple[float, float]:
+    fpr, tpr, _ = roc_curve_points(y, scores)
+    auc = auc_trapz(fpr, tpr)
+
+    plt.figure(figsize=(5.5, 5))
+    plt.plot(fpr, tpr)
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate (1 - specificity)")
+    plt.ylabel("True Positive Rate (recall)")
+    plt.title(f"{title}\nROC AUC = {auc:.3f}")
+    savefig(out_roc)
+
+    r, p, _ = pr_curve_points(y, scores)
+    ap = average_precision(y, scores)
+
+    plt.figure(figsize=(5.5, 5))
+    plt.plot(r, p)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"{title}\nAverage Precision = {ap:.3f}")
+    savefig(out_pr)
+
+    return auc, ap
+
+
+def plot_confusion(tp: int, tn: int, fp: int, fn: int, title: str, out: Path) -> None:
+    mat = np.array([[tp, fn],
+                    [fp, tn]], dtype=int)
+    plt.figure(figsize=(4.8, 4.2))
+    plt.imshow(mat, interpolation="nearest")
+    plt.xticks([0, 1], ["Pred +", "Pred -"])
+    plt.yticks([0, 1], ["True +", "True -"])
     plt.title(title)
-    plt.legend(loc="lower right", frameon=True)
-    plt.text(0.02, 0.02, f"n_pos={n_pos}, n_neg={n_neg}", transform=plt.gca().transAxes)
+    for (i, j), v in np.ndenumerate(mat):
+        plt.text(j, i, str(v), ha="center", va="center", fontsize=12)
+    plt.colorbar(label="Count")
     plt.tight_layout()
-    plt.savefig(path, dpi=220)
+    plt.savefig(out, dpi=320)
     plt.close()
 
 
-def save_pr_plot(path: Path, recall, precision, ap, ap_ci, metric, prevalence):
-    plt.figure(figsize=(6.2, 5.2))
-    plt.plot(recall, precision, label="PR curve")
-    # baseline precision = prevalence
-    plt.axhline(prevalence, linestyle="--", label=f"Baseline (prevalence={prevalence:.3f})")
-    plt.xlabel("Recall (Sensitivity)")
-    plt.ylabel("Precision (PPV)")
-    plt.ylim(0, 1.02)
-    plt.xlim(0, 1.0)
-    plt.title(f"Precision–Recall curve (score = {metric})\nAP = {ap:.3f} (95% CI {ap_ci[0]:.3f}–{ap_ci[1]:.3f})")
-    plt.legend(loc="lower left", frameon=True)
-    plt.tight_layout()
-    plt.savefig(path, dpi=220)
-    plt.close()
+def plot_permutation_hist(perms: np.ndarray, obs: float, pval: float, title: str, out: Path) -> None:
+    plt.figure(figsize=(6.5, 4))
+    plt.hist(perms, bins=40, alpha=0.75)
+    plt.axvline(obs, linestyle="--")
+    plt.axvline(0.5, linestyle=":")
+    plt.xlabel("Permuted ROC AUC")
+    plt.ylabel("Count")
+    plt.title(f"{title}\nObserved AUC={obs:.3f}  Permutation p={pval:.3g}")
+    savefig(out)
 
 
-def save_metrics_vs_threshold_plot(path: Path, perf: pd.DataFrame, metric: str, best_threshold=None, rule_desc=""):
-    plt.figure(figsize=(7.0, 5.2))
-    plt.plot(perf["threshold_score"], perf["sensitivity"], label="Sensitivity (Recall)")
-    plt.plot(perf["threshold_score"], perf["specificity"], label="Specificity")
-    plt.plot(perf["threshold_score"], perf["precision"], label="Precision (PPV)")
-    plt.plot(perf["threshold_score"], perf["F1"], label="F1 score")
-    plt.plot(perf["threshold_score"], perf["youden_J"], label="Youden's J")
+def plot_bootstrap_cis(ci: Dict[str, Tuple[float, float]], point: Dict[str, float], title: str, out: Path) -> None:
+    keys = ["auc", "ap", "f1", "recall", "specificity", "precision"]
+    labels = [k.upper() for k in keys]
+    ys = np.arange(len(keys))[::-1]
 
-    if best_threshold is not None and np.isfinite(best_threshold):
-        plt.axvline(best_threshold, linestyle="--", label=f"Selected threshold = {best_threshold:.4g}")
-
-    plt.xlabel("Score threshold T (call positive if score ≥ T)")
-    plt.ylabel("Metric value")
-    ttl = f"Threshold scan (score = {metric})"
-    if rule_desc:
-        ttl += f"\nSelection rule: {rule_desc}"
-    plt.title(ttl)
-    plt.legend(loc="best", frameon=True, ncol=2)
-    plt.tight_layout()
-    plt.savefig(path, dpi=220)
-    plt.close()
+    plt.figure(figsize=(7.5, 4.5))
+    for yv, k in zip(ys, keys):
+        lo, hi = ci.get(k, (np.nan, np.nan))
+        mid = point.get(k, np.nan)
+        plt.plot([lo, hi], [yv, yv], linewidth=3)
+        plt.plot([mid], [yv], marker="o")
+    plt.yticks(ys, labels)
+    plt.xlabel("Metric value")
+    plt.title(title + "\n(bootstrap 95% CI bars; point = estimate)")
+    savefig(out)
 
 
-def save_bootstrap_hist(path: Path, values: np.ndarray, xlabel: str, title: str, vline=None):
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    plt.figure(figsize=(6.2, 5.2))
-    if values.size:
-        plt.hist(values, bins=45)
-    if vline is not None and np.isfinite(vline):
-        plt.axvline(vline, linestyle="--", label="Observed")
-        plt.legend(frameon=True)
-    plt.xlabel(xlabel)
-    plt.ylabel("Bootstrap count")
+def plot_beta_posteriors(post_params: Dict[str, Tuple[float, float]], out: Path, title: str) -> None:
+    grid = np.linspace(0.001, 0.999, 500)
+    plt.figure(figsize=(7, 4.5))
+    for name, (a, b) in post_params.items():
+        pdf = beta_pdf_grid(a, b, grid)
+        plt.plot(grid, pdf, label=f"{name} (mean={a/(a+b):.2f})")
+    plt.xlabel("Probability")
+    plt.ylabel("Density")
     plt.title(title)
-    plt.tight_layout()
-    plt.savefig(path, dpi=220)
-    plt.close()
+    plt.legend()
+    savefig(out)
 
 
-def save_2d_heatmap(path: Path, scan2d: pd.DataFrame, t_m: np.ndarray, t_s: np.ndarray,
-                    second_name: str, value_col: str, best_pair=None, title_extra=""):
-    # build matrix [len(t_m) x len(t_s)]
-    mat = np.full((len(t_m), len(t_s)), np.nan, dtype=float)
-    # indexing maps
-    idx_m = {v: i for i, v in enumerate(t_m)}
-    idx_s = {v: j for j, v in enumerate(t_s)}
-
-    for _, row in scan2d.iterrows():
-        i = idx_m[row["Tm_mapped_hq"]]
-        j = idx_s[row[f"Ts_{second_name}"]]
-        mat[i, j] = row[value_col]
-
-    plt.figure(figsize=(7.4, 5.6))
-    im = plt.imshow(mat, origin="lower", aspect="auto")
-    plt.colorbar(im, label=value_col)
-
-    plt.xlabel(f"Threshold Ts ({second_name})")
-    plt.ylabel("Threshold Tm (mapped_hq)")
-    plt.title(f"2D threshold scan heatmap: {value_col}\n"
-              f"Positive if (mapped_hq ≥ Tm) AND ({second_name} ≥ Ts){title_extra}")
-
-    # Use a sparse tick set for readability
-    def sparse_ticks(vals, max_ticks=8):
-        if len(vals) <= max_ticks:
-            idx = np.arange(len(vals))
-        else:
-            idx = np.unique(np.round(np.linspace(0, len(vals) - 1, max_ticks)).astype(int))
-        return idx, [f"{vals[i]:.4g}" for i in idx]
-
-    xt_idx, xt_lbl = sparse_ticks(t_s, max_ticks=8)
-    yt_idx, yt_lbl = sparse_ticks(t_m, max_ticks=8)
-    plt.xticks(xt_idx, xt_lbl, rotation=45, ha="right")
-    plt.yticks(yt_idx, yt_lbl)
-
-    if best_pair is not None:
-        tm = float(best_pair["Tm_mapped_hq"])
-        ts = float(best_pair[f"Ts_{second_name}"])
-        plt.scatter([idx_s[ts]], [idx_m[tm]], marker="x")
-        plt.text(idx_s[ts], idx_m[tm], "  best", va="center")
-
-    plt.tight_layout()
-    plt.savefig(path, dpi=220)
-    plt.close()
+def plot_corr_heatmap(df: pd.DataFrame, metrics: List[str], out: Path) -> None:
+    sub = df[metrics].copy()
+    corr = sub.corr(numeric_only=True)
+    plt.figure(figsize=(0.8 * len(metrics) + 2, 0.8 * len(metrics) + 2))
+    plt.imshow(corr.values, vmin=-1, vmax=1)
+    plt.colorbar(label="Pearson r")
+    plt.xticks(range(len(metrics)), metrics, rotation=45, ha="right")
+    plt.yticks(range(len(metrics)), metrics)
+    for (i, j), v in np.ndenumerate(corr.values):
+        if np.isfinite(v):
+            plt.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=9)
+    plt.title("Correlation between candidate metrics")
+    savefig(out)
 
 
-# ----------------------------
+# -----------------------------
 # main
-# ----------------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Alignment-based CMV detection: ROC + PR + bootstrap CIs + optional 2D threshold search."
-    )
-    ap.add_argument("--truth", required=True, help="Truth TSV with sample + truth_cmv_present (0/1).")
-    ap.add_argument("--cmv-bam-dir", required=True, help="Directory containing CMV-alignment BAMs.")
-    ap.add_argument("--outdir", required=True, help="Output directory.")
-    ap.add_argument("--mapq", type=int, default=30, help="MAPQ cutoff for CMV mapped reads and breadth.")
-    ap.add_argument("--breadth-depth-min", type=int, default=1, help="Depth threshold for breadth (>= this counts as covered).")
-    ap.add_argument("--breadth-method", choices=["coverage", "depth"], default="coverage", help="Breadth method.")
+# -----------------------------
+def build_modelling_table(truth: pd.DataFrame, bam: pd.DataFrame, genes: pd.DataFrame, blast: pd.DataFrame) -> pd.DataFrame:
+    df = truth.copy()
+    for other in [bam, genes, blast]:
+        if other is not None and not other.empty:
+            df = df.merge(other, on="base", how="left")
 
-    ap.add_argument("--metric", choices=["mapped_hq", "rpm_hq", "breadth", "cov_bases", "combo"], default="mapped_hq",
-                    help="Which alignment metric to use as 1D ROC/PR score.")
-    ap.add_argument("--rule", choices=["youden", "minscore_sens_fpr"], default="youden",
-                    help="Threshold selection rule for 1D score.")
-    ap.add_argument("--min-sensitivity", type=float, default=0.99, help="Used when rule=minscore_sens_fpr.")
-    ap.add_argument("--max-fpr", type=float, default=0.05, help="Used when rule=minscore_sens_fpr.")
+    if "cmv_cov_bases_mapq" in df.columns and "cmv_ref_bases" in df.columns:
+        df["cmv_breadth_from_cov"] = df["cmv_cov_bases_mapq"] / df["cmv_ref_bases"].replace({0: np.nan})
 
-    ap.add_argument("--permute", type=int, default=0, help="Permutation iterations for AUC p-value (0 disables).")
-    ap.add_argument("--bootstrap", type=int, default=2000, help="Bootstrap resamples for CI estimation (0 disables).")
-    ap.add_argument("--seed", type=int, default=1)
+    if "cmv_mapped_reads_mapq" in df.columns:
+        df["log10_mapped_hq"] = np.log10(df["cmv_mapped_reads_mapq"].replace({0: np.nan}))
 
-    # 2D search options
-    ap.add_argument("--two-dim", choices=["none", "mapped_breadth", "mapped_covbases"], default="none",
-                    help="Run 2D threshold search: mapped_hq + breadth OR mapped_hq + covered_bases.")
-    ap.add_argument("--rule2d", choices=["youden", "max_f1", "minscore_sens_fpr"], default="youden",
-                    help="Selection rule for 2D thresholds.")
-    ap.add_argument("--top2d", type=int, default=50, help="Write top-N 2D threshold pairs by Youden (or chosen objective).")
+    if "gene_mean_depth" in df.columns:
+        df["log10_gene_mean_depth"] = np.log10(df["gene_mean_depth"].replace({0: np.nan}))
 
-    args = ap.parse_args()
+    if "cmv_rpm_mapq" in df.columns:
+        df["log10_rpm_hq"] = np.log10(df["cmv_rpm_mapq"].replace({0: np.nan}))
 
+    df["y_true"] = df["y_true"].astype(int)
+    return df
+
+
+def run(args: argparse.Namespace) -> None:
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    figdir = outdir / "figures"
+    ensure_dir(figdir)
 
-    # Load truth
+    csv_dirs = [Path(p) for p in args.csv_dir]
     truth = load_truth(Path(args.truth))
 
-    # Find BAMs and compute metrics
-    bams = find_bams(Path(args.cmv_bam_dir))
+    bam = load_alignment_summaries(csv_dirs)
+    genes = load_gene_metrics(csv_dirs)
+    blast = load_blast_top5(csv_dirs)
+
+    df = build_modelling_table(truth, bam, genes, blast)
+
+    candidate_metrics = [
+        "cmv_mapped_reads_mapq",
+        "cmv_rpm_mapq",
+        "cmv_breadth_mapq",
+        "cmv_breadth_from_cov",
+        "gene_mean_depth",
+        "gene_min_depth",
+        "UL97_mean_depth",
+        "UL54_mean_depth",
+        "blast_cmv_mean_identity_top5",
+        "blast_cmv_hits_top5",
+        "log10_mapped_hq",
+        "log10_rpm_hq",
+        "log10_gene_mean_depth",
+    ]
+    candidate_metrics = [m for m in candidate_metrics if m in df.columns]
+
+    if not candidate_metrics:
+        die("No candidate metrics were found after merging. Check your csv_dir contents.")
+
+    df = df[np.isfinite(df["y_true"].to_numpy(dtype=float))].copy()
+    df.to_csv(outdir / "metrics_table.tsv", sep="\t", index=False)
+
+    y = df["y_true"].to_numpy(dtype=int)
+
+    plot_corr_heatmap(df, [m for m in candidate_metrics if df[m].notna().any()], figdir / "metric_correlation.png")
+
+    rng = np.random.default_rng(args.seed)
 
     rows = []
-    for bam in bams:
-        sample = re.sub(r"\.bam$", "", bam.name, flags=re.IGNORECASE)
-        base = canonical_sample(sample)
-
-        total_reads_bam = samtools_count(bam, mapped_only=False, mapq=None)
-        mapped_hq = samtools_count(bam, mapped_only=True, mapq=args.mapq)
-        rpm_hq = (mapped_hq / total_reads_bam * 1e6) if total_reads_bam else 0.0
-
-        breadth, cov_bases, ref_bases = breadth_of_coverage(
-            bam, mapq=args.mapq, depth_min=args.breadth_depth_min, method=args.breadth_method
-        )
-
-        rows.append({
-            "base": base,
-            "bam": str(bam),
-            "total_reads_in_cmv_bam": int(total_reads_bam),
-            "cmv_mapped_reads_mapq": int(mapped_hq),
-            "cmv_rpm_mapq": float(rpm_hq),
-            "cmv_breadth_mapq": float(breadth),
-            "cmv_cov_bases_mapq": int(cov_bases),
-            "cmv_ref_bases": int(ref_bases),
+    per_metric_df_rows = []
+    for m in candidate_metrics:
+        if not df[m].notna().any():
+            continue
+        best, auc, ap, thr = choose_best_single_metric(df, y, m)
+        per_metric_df_rows.append({
+            "metric": m,
+            "best_threshold": thr,
+            "tp": best.tp, "tn": best.tn, "fp": best.fp, "fn": best.fn,
+            "precision": best.precision, "recall": best.recall, "specificity": best.specificity, "f1": best.f1,
+            "roc_auc": auc, "avg_precision": ap,
         })
 
-    align_df = pd.DataFrame(rows).sort_values("base").reset_index(drop=True)
+        plot_metric_distributions(df, y, m, figdir / f"dist_{m}.png")
+        plot_roc_pr(y, df[m].to_numpy(dtype=float), f"Single metric: {m}", figdir / f"roc_{m}.png", figdir / f"pr_{m}.png")
+        plot_confusion(best.tp, best.tn, best.fp, best.fn,
+                       title=f"{m} @ thr={thr:.3g}\nF1={best.f1:.3f} Recall={best.recall:.3f} Spec={best.specificity:.3f}",
+                       out=figdir / f"conf_{m}.png")
 
-    # Basic RPM sanity warning
-    if "total_reads_in_cmv_bam" in align_df.columns and "cmv_mapped_reads_mapq" in align_df.columns:
-        # If BAM is mapped-only, total ~= mapped for many samples.
-        # We'll warn if >30% samples have total <= mapped+2 and mapped > 0.
-        near_equal = ((align_df["total_reads_in_cmv_bam"] <= (align_df["cmv_mapped_reads_mapq"] + 2)) &
-                      (align_df["cmv_mapped_reads_mapq"] > 0)).mean()
-        if near_equal > 0.30:
-            print("⚠️ Warning: Many samples have total_reads_in_cmv_bam ~= mapped_hq.")
-            print("   If your CMV BAMs are mapped-only, RPM computed using BAM total is not meaningful.")
-            print("   Prefer mapped_hq + breadth/cov_bases, or provide an external denominator.")
+        if args.permutation_n > 0:
+            obs, pval, perms = permutation_test_auc(y, df[m].to_numpy(dtype=float), args.permutation_n, rng)
+            plot_permutation_hist(perms, obs, pval, f"Permutation test: {m}", figdir / f"perm_auc_{m}.png")
 
-    # Merge truth
-    df = truth.merge(align_df, on="base", how="left")
-    if df["bam"].isna().any():
-        missing = df[df["bam"].isna()]["base"].tolist()
-        print("⚠️ Warning: missing BAMs for these bases in truth table:")
-        print("  " + ", ".join(missing))
+    per_metric_df = pd.DataFrame(per_metric_df_rows).sort_values(["f1", "recall", "specificity"], ascending=False)
+    per_metric_df.to_csv(outdir / "per_metric_performance.tsv", sep="\t", index=False)
 
-    # Drop rows without BAMs for analysis
-    df_roc = df.dropna(subset=["bam"]).copy()
-    y = df_roc["truth_cmv_present"].to_numpy(dtype=int)
+    # pool metrics for combination search
+    top_f1 = per_metric_df.sort_values("f1", ascending=False).head(args.top_k_metrics)["metric"].tolist()
+    top_auc = per_metric_df.sort_values("roc_auc", ascending=False).head(args.top_k_metrics)["metric"].tolist()
+    pool = []
+    for m in (top_f1 + top_auc):
+        if m not in pool:
+            pool.append(m)
+    pool = pool[: max(args.top_k_metrics, 6)]
 
-    scores = pick_score(df_roc, args.metric)
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-    prevalence = safe_div(n_pos, len(y))
+    preferred = ["cmv_mapped_reads_mapq", "cmv_breadth_mapq", "gene_mean_depth", "blast_cmv_mean_identity_top5"]
+    preferred = [m for m in preferred if m in df.columns and df[m].notna().any()]
+    for m in preferred:
+        if m not in pool:
+            pool.append(m)
 
-    # 1D ROC / PR
-    auc = roc_auc_rank(y, scores)
-    roc_pts = roc_points_from_scores(y, scores)
-    recall, precision, _thr_pr = pr_points_from_scores(y, scores)
-    ap_score = average_precision(y, scores)
-
-    # Threshold scan & selection (1D)
-    perf = threshold_scan_1d(y, scores)
-    best = select_threshold_1d(perf, args.rule, args.min_sensitivity, args.max_fpr)
-
-    # Permutation test for AUC (optional)
-    p_perm = None
-    auc_null = None
-    if args.permute and args.permute > 0:
-        rng = np.random.default_rng(args.seed)
-        aucs = []
-        for _ in range(args.permute):
-            y_perm = rng.permutation(y)
-            aucs.append(roc_auc_rank(y_perm, scores))
-        aucs = np.asarray(aucs, dtype=float)
-        auc_null = aucs
-        p_perm = (1.0 + float((aucs >= auc).sum())) / (1.0 + len(aucs))
-
-    # Bootstrap CIs (optional)
-    boot = None
-    auc_ci = (float("nan"), float("nan"))
-    ap_ci = (float("nan"), float("nan"))
-    if args.bootstrap and args.bootstrap > 0:
-        boot = bootstrap_summary(
-            y=y,
-            scores=scores,
-            rule=args.rule,
-            min_sens=args.min_sensitivity,
-            max_fpr=args.max_fpr,
-            n_boot=args.bootstrap,
-            seed=args.seed,
-        )
-        auc_ci = boot["auc_ci95"]
-        ap_ci = boot["ap_ci95"]
-
-    # ----------------------------
-    # Write outputs (1D)
-    # ----------------------------
-    df.to_csv(outdir / "per_sample_alignment_metrics_with_truth.tsv", sep="\t", index=False)
-    perf.to_csv(outdir / "threshold_scan_1d.tsv", sep="\t", index=False)
-
-    # Bootstrap outputs
-    if boot is not None:
-        boot_df = pd.DataFrame({
-            "auc": boot["aucs"],
-            "ap": boot["aps"],
-            "selected_threshold": boot["ths"],
-            "sensitivity": boot["sens"],
-            "specificity": boot["spec"],
-            "precision": boot["prec"],
-            "f1": boot["f1"],
-            "fpr": boot["fpr"],
-        })
-        boot_df.to_csv(outdir / "bootstrap_samples_1d.tsv", sep="\t", index=False)
-
-    # ----------------------------
-    # Plots (1D)
-    # ----------------------------
-    save_roc_plot(
-        outdir / "roc_alignment.png",
-        roc_pts=roc_pts,
-        auc=auc,
-        auc_ci=auc_ci,
-        metric=args.metric,
-        n_pos=n_pos,
-        n_neg=n_neg,
-        p_perm=p_perm,
-    )
-
-    save_pr_plot(
-        outdir / "pr_alignment.png",
-        recall=recall,
-        precision=precision,
-        ap=ap_score,
-        ap_ci=ap_ci,
-        metric=args.metric,
-        prevalence=prevalence,
-    )
-
-    rule_desc = args.rule
-    if args.rule == "minscore_sens_fpr":
-        rule_desc += f" (min_sens={args.min_sensitivity}, max_fpr={args.max_fpr})"
-    best_t = float(best["threshold_score"]) if best is not None else None
-
-    save_metrics_vs_threshold_plot(
-        outdir / "metrics_vs_threshold_1d.png",
-        perf=perf,
-        metric=args.metric,
-        best_threshold=best_t,
-        rule_desc=rule_desc,
-    )
-
-    if boot is not None:
-        save_bootstrap_hist(
-            outdir / "bootstrap_auc_hist.png",
-            boot["aucs"],
-            xlabel="AUC",
-            title=f"Bootstrap distribution of AUC (n={len(boot['aucs'])}, skipped={boot['skipped']})",
-            vline=auc,
-        )
-        save_bootstrap_hist(
-            outdir / "bootstrap_threshold_hist.png",
-            boot["ths"],
-            xlabel="Selected threshold (score)",
-            title=f"Bootstrap distribution of selected threshold (rule={rule_desc})",
-            vline=best_t if best_t is not None else float("nan"),
-        )
-        save_bootstrap_hist(
-            outdir / "bootstrap_sensitivity_hist.png",
-            boot["sens"],
-            xlabel="Sensitivity at selected threshold",
-            title="Bootstrap distribution of sensitivity at selected threshold",
-            vline=float(best["sensitivity"]) if best is not None else float("nan"),
-        )
-        save_bootstrap_hist(
-            outdir / "bootstrap_specificity_hist.png",
-            boot["spec"],
-            xlabel="Specificity at selected threshold",
-            title="Bootstrap distribution of specificity at selected threshold",
-            vline=float(best["specificity"]) if best is not None else float("nan"),
-        )
-
-    if auc_null is not None:
-        save_bootstrap_hist(
-            outdir / "auc_permutation_null.png",
-            auc_null,
-            xlabel="AUC under permuted labels",
-            title=f"Permutation null of AUC (obs={auc:.3f}, p={p_perm:.3g}, n={len(auc_null)})",
-            vline=auc,
-        )
-
-    # ----------------------------
-    # 2D threshold search (optional)
-    # ----------------------------
-    best2d = None
-    scan2d = None
-    second_name = None
-
-    if args.two_dim != "none":
-        mapped = df_roc["cmv_mapped_reads_mapq"].to_numpy(dtype=float)
-
-        if args.two_dim == "mapped_breadth":
-            second = df_roc["cmv_breadth_mapq"].to_numpy(dtype=float)
-            second_name = "breadth"
-        elif args.two_dim == "mapped_covbases":
-            second = df_roc["cmv_cov_bases_mapq"].to_numpy(dtype=float)
-            second_name = "cov_bases"
-        else:
-            raise ValueError("Unexpected --two-dim value")
-
-        scan2d, t_m, t_s = threshold_scan_2d(y, mapped, second, second_name=second_name)
-
-        # rank + write top N (by chosen objective)
-        if args.rule2d == "youden":
-            obj = scan2d["youden_J"].fillna(-1e18)
-            scan2d["objective"] = obj
-        elif args.rule2d == "max_f1":
-            obj = scan2d["F1"].fillna(-1e18)
-            scan2d["objective"] = obj
-        else:
-            # for constraint rule, use objective=Youden for sorting, but selection is lexicographic within feasible set
-            scan2d["objective"] = scan2d["youden_J"].fillna(-1e18)
-
-        scan2d_sorted = scan2d.sort_values("objective", ascending=False).reset_index(drop=True)
-        scan2d_sorted.head(int(args.top2d)).to_csv(outdir / f"threshold_scan_2d_top{args.top2d}_{args.two_dim}.tsv", sep="\t", index=False)
-        scan2d.to_csv(outdir / f"threshold_scan_2d_full_{args.two_dim}.tsv", sep="\t", index=False)
-
-        best2d = select_threshold_2d(
-            scan2d=scan2d,
-            rule=args.rule2d,
-            min_sens=args.min_sensitivity,
-            max_fpr=args.max_fpr,
-            second_name=second_name,
-        )
-
-        # Heatmaps (Youden + F1 are usually most interpretable)
-        extra = ""
-        if args.rule2d == "minscore_sens_fpr":
-            extra = f"\nConstraint: sens≥{args.min_sensitivity}, FPR≤{args.max_fpr}"
-        save_2d_heatmap(
-            outdir / f"heatmap_2d_youden_{args.two_dim}.png",
-            scan2d=scan2d,
-            t_m=t_m,
-            t_s=t_s,
-            second_name=second_name,
-            value_col="youden_J",
-            best_pair=best2d,
-            title_extra=extra,
-        )
-        save_2d_heatmap(
-            outdir / f"heatmap_2d_f1_{args.two_dim}.png",
-            scan2d=scan2d,
-            t_m=t_m,
-            t_s=t_s,
-            second_name=second_name,
-            value_col="F1",
-            best_pair=best2d,
-            title_extra=extra,
-        )
-
-    # ----------------------------
-    # report
-    # ----------------------------
-    with open(outdir / "report_alignment_thresholding.txt", "w") as f:
-        f.write("Alignment-based CMV detection threshold optimisation\n\n")
-        f.write(f"Truth samples with BAMs: n={len(y)} (pos={n_pos}, neg={n_neg}, prevalence={prevalence:.4g})\n\n")
-
-        f.write("=== Per-BAM metric settings ===\n")
-        f.write(f"MAPQ cutoff: {args.mapq}\n")
-        f.write(f"Breadth method: {args.breadth_method} (depth>= {args.breadth_depth_min})\n\n")
-
-        f.write("=== 1D Score evaluation ===\n")
-        f.write(f"Score metric: {args.metric}\n")
-        f.write(f"ROC AUC: {auc:.6g}\n")
-        f.write(f"PR Average Precision (AP): {ap_score:.6g}\n")
-
-        if p_perm is not None:
-            f.write(f"Permutation p-value (one-sided, AUC>=obs): {p_perm:.6g} (n={args.permute})\n")
-
-        if boot is not None:
-            f.write("\n--- Bootstrap 95% CIs (percentile) ---\n")
-            f.write(f"AUC 95% CI: {boot['auc_ci95'][0]:.6g} – {boot['auc_ci95'][1]:.6g}\n")
-            f.write(f"AP  95% CI: {boot['ap_ci95'][0]:.6g} – {boot['ap_ci95'][1]:.6g}\n")
-            f.write(f"Selected threshold 95% CI: {boot['th_ci95'][0]:.6g} – {boot['th_ci95'][1]:.6g}\n")
-            f.write(f"Sensitivity 95% CI: {boot['sens_ci95'][0]:.6g} – {boot['sens_ci95'][1]:.6g}\n")
-            f.write(f"Specificity 95% CI: {boot['spec_ci95'][0]:.6g} – {boot['spec_ci95'][1]:.6g}\n")
-            f.write(f"Precision   95% CI: {boot['prec_ci95'][0]:.6g} – {boot['prec_ci95'][1]:.6g}\n")
-            f.write(f"F1          95% CI: {boot['f1_ci95'][0]:.6g} – {boot['f1_ci95'][1]:.6g}\n")
-            f.write(f"FPR         95% CI: {boot['fpr_ci95'][0]:.6g} – {boot['fpr_ci95'][1]:.6g}\n")
-            f.write(f"Bootstrap iterations skipped (all-pos/all-neg resamples): {boot['skipped']}\n")
-
-        f.write("\n=== 1D Threshold selection ===\n")
-        if args.rule == "youden":
-            f.write("Rule: maximise Youden's J (sens + spec - 1)\n")
-        else:
-            f.write(f"Rule: smallest threshold meeting constraints: sens≥{args.min_sensitivity}, FPR≤{args.max_fpr}\n")
-
-        if best is None:
-            f.write("Selected threshold: NONE (no feasible threshold found)\n")
-        else:
-            f.write(f"Selected threshold (score): {best['threshold_score']:.6g}\n")
-            f.write(f"TP={best['TP']} TN={best['TN']} FP={best['FP']} FN={best['FN']}\n")
-            f.write(f"Sensitivity={best['sensitivity']:.4g} Specificity={best['specificity']:.4g} FPR={best['FPR']:.4g}\n")
-            f.write(f"Precision={best['precision']:.4g} F1={best['F1']:.4g} YoudenJ={best['youden_J']:.4g}\n")
-
-        if args.two_dim != "none":
-            f.write("\n=== 2D Threshold search ===\n")
-            f.write(f"Mode: {args.two_dim} (positive if mapped_hq>=Tm AND {second_name}>=Ts)\n")
-            f.write(f"Selection rule (2D): {args.rule2d}\n")
-            if args.rule2d == "minscore_sens_fpr":
-                f.write(f"Constraints: sens≥{args.min_sensitivity}, FPR≤{args.max_fpr}\n")
-            if best2d is None:
-                f.write("Selected 2D threshold pair: NONE\n")
+    def combos(items: List[str], r: int) -> List[List[str]]:
+        out = []
+        n = len(items)
+        idx = list(range(r))
+        while True:
+            out.append([items[i] for i in idx])
+            for i in reversed(range(r)):
+                if idx[i] != i + n - r:
+                    break
             else:
-                f.write(f"Selected Tm (mapped_hq): {best2d['Tm_mapped_hq']:.6g}\n")
-                f.write(f"Selected Ts ({second_name}): {best2d[f'Ts_{second_name}']:.6g}\n")
-                f.write(f"TP={best2d['TP']} TN={best2d['TN']} FP={best2d['FP']} FN={best2d['FN']}\n")
-                f.write(f"Sensitivity={best2d['sensitivity']:.4g} Specificity={best2d['specificity']:.4g} FPR={best2d['FPR']:.4g}\n")
-                f.write(f"Precision={best2d['precision']:.4g} F1={best2d['F1']:.4g} YoudenJ={best2d['youden_J']:.4g}\n")
+                return out
+            idx[i] += 1
+            for j in range(i + 1, r):
+                idx[j] = idx[j - 1] + 1
 
-    # Console summary
-    print("✅ Done")
-    print(f"Outputs in: {outdir}")
-    print("Key outputs:")
-    print("  - per_sample_alignment_metrics_with_truth.tsv")
-    print("  - threshold_scan_1d.tsv")
-    print("  - roc_alignment.png")
-    print("  - pr_alignment.png")
-    print("  - metrics_vs_threshold_1d.png")
-    print("  - report_alignment_thresholding.txt")
-    if boot is not None:
-        print("  - bootstrap_samples_1d.tsv")
-        print("  - bootstrap_auc_hist.png")
-        print("  - bootstrap_threshold_hist.png")
-        print("  - bootstrap_sensitivity_hist.png")
-        print("  - bootstrap_specificity_hist.png")
-    if auc_null is not None:
-        print("  - auc_permutation_null.png")
-    if args.two_dim != "none":
-        print(f"  - threshold_scan_2d_full_{args.two_dim}.tsv")
-        print(f"  - threshold_scan_2d_top{args.top2d}_{args.two_dim}.tsv")
-        print(f"  - heatmap_2d_youden_{args.two_dim}.png")
-        print(f"  - heatmap_2d_f1_{args.two_dim}.png")
+    model_rows = []
+    best_overall = None  # (rule, perf, auc, ap)
+
+    max_r = min(args.max_metrics, len(pool))
+    for r in range(2, max_r + 1):
+        for mets in combos(pool, r):
+            # AND
+            rule, perf, auc, ap = choose_best_rule(df, y, mets, requirement="all", k=0)
+            model_rows.append({
+                "model": f"AND({','.join(mets)})",
+                "n_metrics": r,
+                "requirement": "all",
+                "k": r,
+                "tp": perf.tp, "tn": perf.tn, "fp": perf.fp, "fn": perf.fn,
+                "precision": perf.precision, "recall": perf.recall, "specificity": perf.specificity, "f1": perf.f1,
+                "roc_auc": auc, "avg_precision": ap,
+                "thresholds_json": json.dumps(rule.thresholds),
+            })
+            if best_overall is None:
+                best_overall = (rule, perf, auc, ap)
+            else:
+                best_rule, best_perf, _, _ = best_overall
+                if (perf.f1 > best_perf.f1) or \
+                   (perf.f1 == best_perf.f1 and perf.recall > best_perf.recall) or \
+                   (perf.f1 == best_perf.f1 and perf.recall == best_perf.recall and perf.specificity > best_perf.specificity) or \
+                   (perf.f1 == best_perf.f1 and perf.recall == best_perf.recall and perf.specificity == best_perf.specificity and r < len(best_rule.metrics)):
+                    best_overall = (rule, perf, auc, ap)
+
+            # k-of-n (for r>=3)
+            if r >= 3:
+                k = max(2, r - 1)
+                rule2, perf2, auc2, ap2 = choose_best_rule(df, y, mets, requirement="kofn", k=k)
+                model_rows.append({
+                    "model": f"{k}of{r}({','.join(mets)})",
+                    "n_metrics": r,
+                    "requirement": "kofn",
+                    "k": k,
+                    "tp": perf2.tp, "tn": perf2.tn, "fp": perf2.fp, "fn": perf2.fn,
+                    "precision": perf2.precision, "recall": perf2.recall, "specificity": perf2.specificity, "f1": perf2.f1,
+                    "roc_auc": auc2, "avg_precision": ap2,
+                    "thresholds_json": json.dumps(rule2.thresholds),
+                })
+                best_rule, best_perf, _, _ = best_overall
+                if (perf2.f1 > best_perf.f1) or \
+                   (perf2.f1 == best_perf.f1 and perf2.recall > best_perf.recall) or \
+                   (perf2.f1 == best_perf.f1 and perf2.recall == best_perf.recall and perf2.specificity > best_perf.specificity) or \
+                   (perf2.f1 == best_perf.f1 and perf2.recall == best_perf.recall and perf2.specificity == best_perf.specificity and r < len(best_rule.metrics)):
+                    best_overall = (rule2, perf2, auc2, ap2)
+
+    model_df = pd.DataFrame(model_rows).sort_values(["f1", "recall", "specificity", "n_metrics"],
+                                                    ascending=[False, False, False, True])
+    model_df.to_csv(outdir / "model_comparison.tsv", sep="\t", index=False)
+
+    if best_overall is None:
+        die("No combined model could be fit (check that metrics have data).")
+
+    best_rule, best_perf, best_auc, best_ap = best_overall
+        # -----------------------------
+    # EXTRA TABLES: show how final exact thresholds were chosen
+    # -----------------------------
+    def evaluate_rule_with_thresholds(thr_map: Dict[str, float]) -> Dict[str, float]:
+        """Evaluate the FINAL rule structure (same metrics, same requirement/k) using a given threshold dict."""
+        tmp_rule = Rule(
+            name="FINAL_RULE_REEVAL",
+            metrics=best_rule.metrics,
+            thresholds=thr_map,
+            requirement=best_rule.requirement,
+            k=best_rule.k,
+        )
+        yp = tmp_rule.predict(df)
+        tp_, tn_, fp_, fn_ = confusion_from_pred(y, yp)
+        prec_ = safe_div(tp_, tp_ + fp_)
+        rec_ = safe_div(tp_, tp_ + fn_)
+        spec_ = safe_div(tn_, tn_ + fp_)
+        f1_ = safe_div(2 * prec_ * rec_, prec_ + rec_) if (prec_ + rec_) else 0.0
+        score_ = tmp_rule.score_as_float(df)
+        fpr_, tpr_, _ = roc_curve_points(y, score_)
+        auc_ = auc_trapz(fpr_, tpr_)
+        ap_ = average_precision(y, score_)
+        return {
+            "tp": tp_, "tn": tn_, "fp": fp_, "fn": fn_,
+            "precision": prec_, "recall": rec_, "specificity": spec_, "f1": f1_,
+            "roc_auc": auc_, "avg_precision": ap_,
+        }
+
+    # Recreate the EXACT grids used by choose_best_rule for the final metrics
+    final_grids = {}
+    for m in best_rule.metrics:
+        final_grids[m] = pick_candidate_thresholds(df[m].to_numpy(dtype=float), n_grid=30)
+
+    # Table 1: exact final thresholds + grid info
+    rows_final = []
+    for m in best_rule.metrics:
+        grid = final_grids[m]
+        final_thr = float(best_rule.thresholds[m])
+
+        # Find closest grid value and index (should usually be exact)
+        if grid.size == 0 or (grid.size == 1 and not np.isfinite(grid[0])):
+            rows_final.append({
+                "metric": m,
+                "final_threshold": final_thr,
+                "grid_size": int(grid.size),
+                "closest_grid_value": np.nan,
+                "closest_grid_index": np.nan,
+                "difference_to_grid": np.nan,
+                "grid_min": np.nan,
+                "grid_max": np.nan,
+            })
+            continue
+
+        idx = int(np.nanargmin(np.abs(grid - final_thr)))
+        closest = float(grid[idx])
+        rows_final.append({
+            "metric": m,
+            "final_threshold": final_thr,
+            "grid_size": int(grid.size),
+            "closest_grid_value": closest,
+            "closest_grid_index": idx,
+            "difference_to_grid": float(final_thr - closest),
+            "grid_min": float(np.nanmin(grid)),
+            "grid_max": float(np.nanmax(grid)),
+        })
+
+    final_thresholds_table = pd.DataFrame(rows_final)
+    final_thresholds_table.to_csv(outdir / "final_thresholds_table.tsv", sep="\t", index=False)
+
+    # Table 2: local sensitivity around each final threshold (neighbours in the grid)
+    base_eval = evaluate_rule_with_thresholds(best_rule.thresholds)
+    rows_local = []
+
+    for m in best_rule.metrics:
+        grid = final_grids[m]
+        if grid.size < 2 or not np.isfinite(best_rule.thresholds[m]):
+            continue
+
+        final_thr = float(best_rule.thresholds[m])
+        idx = int(np.nanargmin(np.abs(grid - final_thr)))
+
+        # take neighbouring grid points around the selected one
+        neighbour_idxs = sorted(set([idx - 2, idx - 1, idx, idx + 1, idx + 2]))
+        neighbour_idxs = [i for i in neighbour_idxs if 0 <= i < len(grid)]
+
+        for i in neighbour_idxs:
+            thr_map = dict(best_rule.thresholds)
+            thr_map[m] = float(grid[i])
+            ev = evaluate_rule_with_thresholds(thr_map)
+
+            rows_local.append({
+                "metric_varied": m,
+                "grid_index": i,
+                "threshold_tested": float(grid[i]),
+                "is_final_choice": (i == idx),
+                # performance
+                "tp": ev["tp"], "tn": ev["tn"], "fp": ev["fp"], "fn": ev["fn"],
+                "precision": ev["precision"], "recall": ev["recall"], "specificity": ev["specificity"], "f1": ev["f1"],
+                "roc_auc": ev["roc_auc"], "avg_precision": ev["avg_precision"],
+                # deltas vs final
+                "delta_f1_vs_final": float(ev["f1"] - base_eval["f1"]),
+                "delta_recall_vs_final": float(ev["recall"] - base_eval["recall"]),
+                "delta_spec_vs_final": float(ev["specificity"] - base_eval["specificity"]),
+                "delta_fp_vs_final": int(ev["fp"] - base_eval["fp"]),
+                "delta_fn_vs_final": int(ev["fn"] - base_eval["fn"]),
+            })
+
+    local_sensitivity_table = pd.DataFrame(rows_local).sort_values(
+        ["metric_varied", "grid_index"]
+    )
+    local_sensitivity_table.to_csv(outdir / "final_threshold_local_sensitivity.tsv", sep="\t", index=False)
+
+    y_pred = best_rule.predict(df)
+    tp, tn, fp, fn = confusion_from_pred(y, y_pred)
+
+    plot_confusion(tp, tn, fp, fn,
+                   title=f"Final combined rule: {best_rule.requirement} ({len(best_rule.metrics)} metrics)\n"
+                         f"F1={best_perf.f1:.3f} Recall={best_perf.recall:.3f} Spec={best_perf.specificity:.3f}",
+                   out=figdir / "final_confusion.png")
+
+    score = best_rule.score_as_float(df)
+    plot_roc_pr(y, score, "Final combined rule (score = fraction of metrics passing)",
+                figdir / "final_roc.png", figdir / "final_pr.png")
+
+    if args.permutation_n > 0:
+        obs, pval, perms = permutation_test_auc(y, score, args.permutation_n, rng)
+        plot_permutation_hist(perms, obs, pval, "Permutation test: final combined rule", figdir / "final_perm_auc.png")
+
+    # Bootstrap on rule score threshold 0.5 (score >=0.5 means >= half the metrics pass)
+    ci = bootstrap_ci_metric(y, score, thr=0.5, n_boot=args.bootstrap_n, rng=rng)
+    point = {
+        "auc": best_auc,
+        "ap": best_ap,
+        "f1": best_perf.f1,
+        "recall": best_perf.recall,
+        "specificity": best_perf.specificity,
+        "precision": best_perf.precision,
+    }
+    plot_bootstrap_cis(ci, point, "Final model performance", figdir / "final_bootstrap_ci.png")
+
+    a_sens, b_sens = beta_posterior(1, 1, tp, fn)
+    a_spec, b_spec = beta_posterior(1, 1, tn, fp)
+    a_ppv, b_ppv = beta_posterior(1, 1, tp, fp)
+    a_npv, b_npv = beta_posterior(1, 1, tn, fn)
+    post = {
+        "Sensitivity": (a_sens, b_sens),
+        "Specificity": (a_spec, b_spec),
+        "PPV": (a_ppv, b_ppv),
+        "NPV": (a_npv, b_npv),
+    }
+    plot_beta_posteriors(post, figdir / "final_bayesian_posteriors.png",
+                         title="Bayesian posteriors at final threshold (Beta(1,1) prior)")
+
+    out_json = {
+        "rule_name": best_rule.name,
+        "requirement": best_rule.requirement,
+        "k": best_rule.k,
+        "metrics": best_rule.metrics,
+        "thresholds": best_rule.thresholds,
+        "operating_point": {
+            "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+            "precision": best_perf.precision,
+            "recall": best_perf.recall,
+            "specificity": best_perf.specificity,
+            "f1": best_perf.f1,
+            "roc_auc": best_auc,
+            "avg_precision": best_ap,
+        },
+        "bootstrap_ci": {k: {"lo": v[0], "hi": v[1]} for k, v in ci.items()},
+        "bayesian_posteriors": {k: {"a": float(v[0]), "b": float(v[1]), "mean": float(v[0] / (v[0] + v[1]))} for k, v in post.items()},
+        "inputs": {"csv_dirs": [str(p) for p in csv_dirs], "truth": str(args.truth)},
+    }
+    with open(outdir / "thresholds.json", "w") as fh:
+        json.dump(out_json, fh, indent=2)
+
+    summary = pd.DataFrame([{
+        "model": f"FINAL_{best_rule.requirement}_{best_rule.k}of{len(best_rule.metrics)}",
+        "metrics": ",".join(best_rule.metrics),
+        "thresholds": json.dumps(best_rule.thresholds),
+        "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+        "precision": best_perf.precision,
+        "recall": best_perf.recall,
+        "specificity": best_perf.specificity,
+        "f1": best_perf.f1,
+        "roc_auc": best_auc,
+        "avg_precision": best_ap,
+    }])
+    summary.to_csv(outdir / "final_model_summary.tsv", sep="\t", index=False)
+
+    print("\n🎉 Threshold optimisation complete.")
+    print(f"Outputs: {outdir}")
+    print(f"Figures: {figdir}")
+    print(f"Final rule JSON: {outdir / 'thresholds.json'}")
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Optimise a multi-metric CMV detection threshold + generate dissertation-ready plots."
+    )
+    ap.add_argument("--truth", required=True, help="Path to truth/metadata.tsv from the simulator sample set.")
+    ap.add_argument("--csv-dir", required=True, nargs="+",
+                    help="One or more pipeline CSV output directories (pass multiple if you ran in batches).")
+    ap.add_argument("--outdir", required=True, help="Output directory for tables + figures.")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--max-metrics", type=int, default=4,
+                    help="Max number of metrics to consider in combined rules (default 4).")
+    ap.add_argument("--top-k-metrics", type=int, default=6,
+                    help="How many top single metrics to pool for combinations (default 6).")
+    ap.add_argument("--permutation-n", type=int, default=2000,
+                    help="Number of permutations for AUC permutation tests (0 disables).")
+    ap.add_argument("--bootstrap-n", type=int, default=2000,
+                    help="Number of bootstrap resamples for CI plots.")
+    return ap
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    run(args)
 
 
 if __name__ == "__main__":

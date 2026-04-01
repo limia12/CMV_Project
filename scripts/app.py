@@ -1371,11 +1371,38 @@ with st.sidebar:
         th_mid_count_poss = st.number_input("Mixed: min mid-AF count (Possible)", 0, 100000, 3, 1)
         th_mid_frac_poss = st.number_input("Mixed: min mid-AF fraction (Possible)", 0.0, 1.0, 0.05, 0.01)
 
-        # CMV detection thresholds based on alignment HQ mapped reads.
-        st.markdown("**CMV detection (alignment HQ mapped)**")
-        th_detect_mapped = st.number_input("Detected threshold (mapped_hq ≥)", 0.0, 1e12, 57.0, 1.0)
-        th_indeterminate_low = st.number_input("Indeterminate lower bound (≥)", value=float(1e-12), format="%.1e")
-        th_not_detected_high = st.number_input("Not detected upper bound (<)", value=float(1e-12), format="%.1e")
+        # CMV detection thresholds based on FINAL multi-metric rule (≥k-of-3).
+        st.markdown("**CMV detection (final multi-metric rule)**")
+        th_detect_log10_rpm = st.number_input(
+            "log10 RPM (HQ mapped) threshold (≥)",
+            min_value=0.0,
+            max_value=10.0,
+            value=2.0,
+            step=0.1,
+        )
+        th_detect_breadth = st.number_input(
+            "CMV genome breadth (MAPQ-filtered) threshold (≥)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0061,
+            step=0.0001,
+            format="%.4f",
+        )
+        th_detect_blast = st.number_input(
+            "Mean BLAST CMV % identity (top 5 hits) threshold (≥)",
+            min_value=0.0,
+            max_value=100.0,
+            value=87.0,
+            step=0.5,
+        )
+        th_detect_k_required = st.number_input(
+            "Metrics required to pass (k-of-3)",
+            min_value=1,
+            max_value=3,
+            value=2,
+            step=1,
+        )
+
 
         # Thresholds for whether UL97/UL54 have enough coverage to assess resistance.
         st.markdown("**Antiviral resistance assessability (UL97/UL54)**")
@@ -1559,40 +1586,96 @@ def _agg_cmv_mapped_hq_by_base(bam_df: pd.DataFrame) -> pd.DataFrame:
     return grp
 
 
-def cmv_presence_call_mapped_hq(
-    cmv_mapped_hq: float,
-    detected_threshold: float = 57.0,
-    indeterminate_low: float = 1e-12,
-    not_detected_high: float = 1e-12,
-) -> str:
+def cmv_presence_call_multi_metric(
+    log10_rpm_hq: float,
+    breadth_mapq: float,
+    blast_mean_identity_top5: float,
+    thr_log10_rpm: float = 2.0,
+    thr_breadth: float = 0.0061,
+    thr_blast: float = 87.0,
+    k_required: int = 2,
+) -> tuple[str, int, dict]:
     """
-    Call CMV presence status based on high-quality mapped reads.
+    Call CMV presence status using the FINAL multi-metric rule (≥k-of-3).
 
-    Logic:
-      - "Not detected"   if x < not_detected_high
-      - "Indeterminate"  if indeterminate_low <= x < detected_threshold
-      - "Detected"       if x >= detected_threshold
+    Metrics:
+      - log10 RPM (HQ mapped reads per million)
+      - CMV genome breadth (MAPQ-filtered)
+      - Mean BLAST CMV % identity (top 5 hits)
 
-    Args:
-        cmv_mapped_hq (float):
-            High-quality mapped reads (or a summed value) for CMV.
-        detected_threshold (float):
-            Threshold at or above which CMV is called "Detected".
-        indeterminate_low (float):
-            Lower bound for the "Indeterminate" band.
-        not_detected_high (float):
-            Upper bound for "Not detected" (exclusive).
+    Rule:
+      - "Detected"      if ≥k_required metrics pass
+      - "Indeterminate" if exactly 1 metric passes
+      - "Not detected"  if 0 metrics pass
 
-    Returns:
-        str:
-            One of: "Not detected", "Indeterminate", "Detected".
+    Returns
+    -------
+    tuple[str, int, dict]
+        (status, n_pass, pass_flags)
+        - status: "Detected" | "Indeterminate" | "Not detected"
+        - n_pass: number of metrics that passed (0-3)
+        - pass_flags: dict with boolean pass/fail per metric
     """
-    x = float(cmv_mapped_hq) if cmv_mapped_hq is not None and np.isfinite(cmv_mapped_hq) else 0.0
-    if x < float(not_detected_high):
-        return "Not detected"
-    if x < float(detected_threshold) and x >= float(indeterminate_low):
-        return "Indeterminate"
-    return "Detected"
+    # Safe numeric coercion
+    x = float(log10_rpm_hq) if log10_rpm_hq is not None and np.isfinite(log10_rpm_hq) else -np.inf
+    y = float(breadth_mapq) if breadth_mapq is not None and np.isfinite(breadth_mapq) else -np.inf
+    z = float(blast_mean_identity_top5) if blast_mean_identity_top5 is not None and np.isfinite(blast_mean_identity_top5) else -np.inf
+
+    pass_rpm = x >= float(thr_log10_rpm)
+    pass_breadth = y >= float(thr_breadth)
+    pass_blast = z >= float(thr_blast)
+
+    n_pass = int(pass_rpm) + int(pass_breadth) + int(pass_blast)
+
+    if n_pass >= int(k_required):
+        status = "Detected"
+    elif n_pass == 1:
+        status = "Indeterminate"
+    else:
+        status = "Not detected"
+
+    flags = {"log10_rpm_hq": pass_rpm, "breadth_mapq": pass_breadth, "blast_mean_id_top5": pass_blast}
+    return status, n_pass, flags
+
+
+def _safe_log10(x: float, eps: float = 1e-12) -> float:
+    """Compute log10(x) safely by adding eps and guarding non-finite values."""
+    if x is None or not np.isfinite(x):
+        return float("nan")
+    return float(np.log10(float(x) + float(eps)))
+
+
+def _agg_cmv_rpm_breadth_by_base(bam_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate CMV RPM (MAPQ-filtered) and breadth per base sample.
+
+    For bases with multiple rows (e.g. multiple files), we take the maximum
+    value per base to avoid diluting strong signals.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ["base", "cmv_rpm_mapq", "cmv_breadth_mapq"]
+    """
+    if bam_df is None or bam_df.empty or "base" not in bam_df.columns:
+        return pd.DataFrame(columns=["base", "cmv_rpm_mapq", "cmv_breadth_mapq"])
+
+    out = bam_df.copy()
+    # Coerce expected numeric columns if present
+    for c in ("cmv_rpm_mapq", "cmv_breadth_mapq"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    if "cmv_rpm_mapq" not in out.columns and "cmv_breadth_mapq" not in out.columns:
+        return pd.DataFrame(columns=["base", "cmv_rpm_mapq", "cmv_breadth_mapq"])
+
+    agg = {"cmv_rpm_mapq": "max", "cmv_breadth_mapq": "max"}
+    grp = out.groupby("base", as_index=False).agg({k: v for k, v in agg.items() if k in out.columns})
+    if "cmv_rpm_mapq" not in grp.columns:
+        grp["cmv_rpm_mapq"] = np.nan
+    if "cmv_breadth_mapq" not in grp.columns:
+        grp["cmv_breadth_mapq"] = np.nan
+    return grp
 
 
 def resistance_assessability_by_base(gene_df: pd.DataFrame, base: str, depth_min: float) -> tuple[bool, dict]:
@@ -1974,20 +2057,111 @@ if csv_dir and st.session_state.get("_load_committed", False):
                 lambda s: pd.to_numeric(s, errors="coerce").dropna().mean()
             )
 
+
+        def _mean_identity_top5_by_base(
+            blast_top5_df: pd.DataFrame,
+            sel_hits_cmv: pd.DataFrame,
+        ) -> pd.Series:
+            """
+            Compute mean BLAST CMV % identity (top 5 hits) per base.
+
+            Priority:
+              1) If blast_top5_df contains a suitable mean-identity column, use that
+                 (prefer the CMV-like species row if multiple species are present).
+              2) Otherwise, fall back to computing a per-read top-5 mean from sel_hits_cmv
+                 (group by base + qseqid, take top 5 by bitscore, then average).
+
+            Returns
+            -------
+            pd.Series
+                Index = base, value = mean % identity (float)
+            """
+            # 1) Use blast_top5.csv if it has a usable column
+            if blast_top5_df is not None and not blast_top5_df.empty and "base" in blast_top5_df.columns:
+                candidates = [
+                    "blast_cmv_mean_identity_top5",
+                    "blast_mean_identity_top5",
+                    "mean_identity_top5",
+                    "mean_pident_top5",
+                    "mean_identity",
+                    "mean_pident",
+                ]
+                col = None
+                for c in candidates:
+                    if c in blast_top5_df.columns:
+                        col = c
+                        break
+                if col:
+                    df = blast_top5_df.copy()
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                    # Prefer rows that look CMV-like if a species/label column exists
+                    if "species" in df.columns:
+                        cmv_pat = re.compile(r"herpesvirus\s*5|cytomegalovirus|\bHCMV\b|HHV-5|Merlin", re.IGNORECASE)
+                        df["_is_cmv"] = df["species"].astype(str).str.contains(cmv_pat, na=False)
+                        # If CMV rows exist for a base, use those; else use the top row by total_hits
+                        out = {}
+                        for b, g in df.groupby("base"):
+                            gg = g[g["_is_cmv"]] if g["_is_cmv"].any() else g
+                            if "total_hits" in gg.columns:
+                                gg = gg.sort_values("total_hits", ascending=False)
+                            out[b] = float(gg[col].iloc[0]) if gg[col].notna().any() else np.nan
+                        return pd.Series(out, dtype=float)
+                    # Otherwise just take the first (or max) per base
+                    return df.groupby("base")[col].max()
+
+            # 2) Fallback: compute from sel_hits_cmv (outfmt 6)
+            if (
+                sel_hits_cmv is None
+                or sel_hits_cmv.empty
+                or "base" not in sel_hits_cmv.columns
+                or "pident" not in sel_hits_cmv.columns
+            ):
+                return pd.Series(dtype=float)
+
+            df = sel_hits_cmv.copy()
+            df["pident"] = pd.to_numeric(df["pident"], errors="coerce")
+            if "bitscore" in df.columns:
+                df["bitscore"] = pd.to_numeric(df["bitscore"], errors="coerce")
+            if "qseqid" not in df.columns:
+                # Without qseqid, best we can do is mean identity over all hits
+                return df.groupby("base")["pident"].mean()
+
+            out = {}
+            for b, gb in df.groupby("base"):
+                per_read = []
+                for _q, gq in gb.groupby("qseqid"):
+                    gq = gq.dropna(subset=["pident"])
+                    if gq.empty:
+                        continue
+                    if "bitscore" in gq.columns and gq["bitscore"].notna().any():
+                        gq = gq.sort_values("bitscore", ascending=False)
+                    top5 = gq["pident"].head(5)
+                    if not top5.empty:
+                        per_read.append(float(top5.mean()))
+                out[b] = float(np.mean(per_read)) if per_read else np.nan
+            return pd.Series(out, dtype=float)
+
         # Build summary output row-by-row to keep logic explicit and easy to follow.
         rows = []
 
         align_agg = _agg_align_by_base(f_align)
         depth_issues = _gene_depth_issues_by_base(f_gene, th_mean_depth_min)
         mean_ident = _mean_identity_by_base(sel_hits)
+        mean_ident_top5 = _mean_identity_top5_by_base(f_top5, sel_hits)
 
-        # CMV mapped HQ reads per base (this is your CMV detection signal).
-        # _agg_cmv_mapped_hq_by_base() is assumed to return columns:
-        #   base, cmv_mapped_hq
-        cmv_mapped_by_base = _agg_cmv_mapped_hq_by_base(f_bam)
-        cmv_mapped_lookup = (
-            {r["base"]: float(r["cmv_mapped_hq"]) for _, r in cmv_mapped_by_base.iterrows()}
-            if not cmv_mapped_by_base.empty
+
+        # CMV RPM + breadth per base (MAPQ-filtered). These are used for the FINAL multi-metric detection rule.
+        # _agg_cmv_rpm_breadth_by_base() returns columns:
+        #   base, cmv_rpm_mapq, cmv_breadth_mapq
+        cmv_rb_by_base = _agg_cmv_rpm_breadth_by_base(f_bam)
+        cmv_rpm_lookup = (
+            {r["base"]: float(r.get("cmv_rpm_mapq", np.nan)) for _, r in cmv_rb_by_base.iterrows()}
+            if not cmv_rb_by_base.empty
+            else {}
+        )
+        cmv_breadth_lookup = (
+            {r["base"]: float(r.get("cmv_breadth_mapq", np.nan)) for _, r in cmv_rb_by_base.iterrows()}
+            if not cmv_rb_by_base.empty
             else {}
         )
 
@@ -2054,17 +2228,30 @@ if csv_dir and st.session_state.get("_load_committed", False):
             )
             non_cmv_status = "present" if non_cmv else "none"
 
-            # CMV presence call using mapped HQ reads.
+            # CMV presence call using FINAL multi-metric rule (≥k-of-3).
             # This is your primary detection output (Detected / Indeterminate / Not detected).
-            cmv_mapped_hq = cmv_mapped_lookup.get(b, 0.0)
-            cmv_status = cmv_presence_call_mapped_hq(
-                cmv_mapped_hq,
-                detected_threshold=float(th_detect_mapped),
-                indeterminate_low=float(th_indeterminate_low),
-                not_detected_high=float(th_not_detected_high),
+            rpm = cmv_rpm_lookup.get(b, np.nan)
+            log10_rpm = _safe_log10(rpm)
+            breadth = cmv_breadth_lookup.get(b, np.nan)
+            blast_top5_mean = mean_ident_top5.get(b, np.nan)
+
+            cmv_status, n_pass, flags = cmv_presence_call_multi_metric(
+                log10_rpm,
+                breadth,
+                blast_top5_mean,
+                thr_log10_rpm=float(th_detect_log10_rpm),
+                thr_breadth=float(th_detect_breadth),
+                thr_blast=float(th_detect_blast),
+                k_required=int(th_detect_k_required),
             )
+
+            # Compact string for summary table (values + how many metrics passed).
+            log10_s = f"{log10_rpm:.2f}" if np.isfinite(log10_rpm) else "n/a"
+            rpm_s = f"{rpm:.2f}" if np.isfinite(rpm) else "n/a"
+            breadth_s = f"{breadth:.4g}" if np.isfinite(breadth) else "n/a"
+            blast_s = f"{blast_top5_mean:.1f}%" if np.isfinite(blast_top5_mean) else "n/a"
             presence_col = (
-                f"{cmv_status} (mapped_hq={int(cmv_mapped_hq) if np.isfinite(cmv_mapped_hq) else 0})"
+                f"{cmv_status} (passes={n_pass}/3; log10RPM={log10_s}, breadth={breadth_s}, BLAST={blast_s})"
             )
 
             # Mixed strain inference based on VAF distribution (mid-frequency variants).
