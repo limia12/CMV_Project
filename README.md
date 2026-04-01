@@ -279,7 +279,9 @@ CMV_Pipeline/
     requirements.txt: additional Python package requirements
     Logs and Outputs
 
-    Outputs are written to the directories specified when running each script. Typical outputs include:
+## Outputs are written to the directories specified when running each script.    
+
+### Typical outputs include:
 
     Filtered FASTQ files
     FastQC reports
