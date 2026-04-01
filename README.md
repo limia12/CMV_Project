@@ -1,182 +1,169 @@
-# CMV_Pipeline_Project
+README.md
+# CMV Whole Genome Sequencing Pipeline
 
-This project helps you analyze sequencing data for **Cytomegalovirus (CMV)**.  
-It guides you through the different steps of the pipeline using a simple window you can click through (no coding needed).  
-At the end, it creates an **interactive report** you can open in your web browser to explore your results.
+The CMV Whole Genome Sequencing Pipeline is designed to detect and characterise Cytomegalovirus (CMV) from short-read sequencing data. It integrates multiple bioinformatics steps into a structured workflow to generate interpretable outputs including viral detection metrics, BLAST-based confirmation, variant calling, and annotation.
 
----
-
-## 1. Installation
-
-### What you need first
-- **Conda** installed (Anaconda or Miniconda)  
-- **Python 3.11 or higher**  
-- A computer with a desktop (so the window can open)  
-- Some bioinformatics tools available (usually through Bioconda):  
-  - `bwa`, `samtools`, `bcftools`, `seqtk`, `blast`, `fastqc`, `trim-galore`, `lofreq`, `parallel`, `picard`
-
-### Set up the project
-
-1. Download the project (clone or unzip):
-   ```bash
-   git clone https://github.com/<your-username>/CMV_Pipeline_Project.git
-   cd CMV_Pipeline_Project
-
-2. Create and activate the environment:
-    ```bash
-    conda env create -f environment.yml
-    conda activate cmv_pipeline
-
-3. Install the Python packages:
-
-    pip install -r requirements.txt
-
-4. Running the Application
-
-### To start the program, type:
-
-- python scripts/cmv_pipeline_gui.py
-
-- A window will open.
-
-- This is where you choose what parts of the pipeline you want to run.
-
-- Each step can be turned on or off with a checkbox.
-
-- For most steps you’ll just need to browse for the input folder and output folder, and sometimes pick the number of cores (threads) to use.
-
-- When you’re ready, click Run Pipeline.
-
-- The program will run the steps you selected and show progress in the window.
-
-- At the end, it will open your interactive report in a browser.
-
-## 5. What Each Step Does
-
-Here’s a short explanation of the options you’ll see in the window:
-
-### Split interleaved FASTQs
-
-- Use this if your FASTQ files have both read pairs in one file.
-
-- Input: folder with interleaved FASTQs
-
-- Output: folder where R1 and R2 files will be saved
-
-### Filtering (quality trimming + FastQC)
-
-- Cleans and trims your raw reads
-
-- Input: folder with FASTQs
-
-- Output: will create filtered_reads/ and fastqc_results/
-
-### Index Human Genome (optional)
-
-- Prepares the human genome reference for alignment
-
-- Input: folder with the reference FASTA
-
-- Output: folder to save the index
-
-### Align to Human Genome (optional)
-
-- Aligns your reads to the human genome (to filter human reads)
-
-- Input: FASTQ folder + indexed reference
-
-- Output: BAM files + BAM statistics
-
-### Unaligned Reads (optional)
-
-- Extracts the reads that did not align to the human genome
-
-### Index CMV Genome
-
-- Same as human indexing, but for CMV
-
-### Align to CMV Genome
-
-- Aligns your reads to the CMV reference
-
-- Output: BAM files and alignment stats
-
-### BLAST
-
-- Runs BLAST on the reads to check for CMV and other viruses
-
-### Variant Calling (LoFreq)
-
-- Finds small variants (SNPs/indels) and makes a table of variant allele frequencies
-
-### Generate Report
-
-- Collects all the outputs and opens the interactive report in your browser
+This pipeline is intended for research and evaluation purposes, particularly in transplant and virology settings, where detection sensitivity and interpretation of viral signal are important.
 
 ---
 
-## 6. The Interactive Report
+## Installation
 
-When the pipeline finishes, your browser will open with the **CMV Interactive Report**.  
-This report has several sections (you can expand and collapse them):
+### Prerequisites
 
-### Alignment Statistics
-- How many reads mapped vs unmapped  
-- Percentage properly paired  
-- Average insert size  
+- Python ≥ 3.8  
+- Conda (recommended)  
+- pip installed  
 
-### Coverage per Gene
-- Bar chart showing average depth across key CMV genes  
+### Required Tools
 
-### BLAST Results
-- Top species detected in your data  
-- Heatmaps showing BLAST identity across the genome and within conserved regions  
+- bwa  
+- samtools  
+- fastqc  
+- trim_galore  
+- blastn (NCBI BLAST+)  
+- lofreq  
+- snpEff  
 
-### Per-base Coverage
-- Heatmaps for depth of coverage within specific CMV regions  
+---
 
-### Genome-wide Coverage
-- Line plot of depth across the whole CMV genome  
+### Steps
 
-### FastQC Reports
-- Summary tables for read quality checks  
-- Option to preview and download the full FastQC reports  
+#### 1. Clone the repository
 
-### Variants (LoFreq VAF)
-- Table of variants with allele frequencies  
-- Plots showing allele frequency distribution and positions  
-- A simple flag to suggest if there may be mixed strains or co-infection  
+```bash
+git clone <your_repository_url>
+cd CMV_Pipeline
+2. Create and activate environment
+conda create -n cmv_pipeline python=3.10
+conda activate cmv_pipeline
+3. Install dependencies
+conda install -c bioconda bwa samtools fastqc trim-galore blast lofreq snpeff
+conda install -c conda-forge pandas numpy matplotlib streamlit plotly pysam
+4. Prepare reference genome
+bash index_genome.sh reference.fa
+5. Build snpEff database
+bash build_snpeff_db.sh reference.fa annotation.gff snpeff_db/
+6. Create BLAST database
+makeblastdb -in viral_sequences.fna -dbtype nucl -out viral_nt_db
+Usage
+1. Quality Control and Filtering
+bash filtering.sh input_fastq/ qc_output/ 20 4
 
+This step:
 
-7. Project Structure
+Trims reads using Trim Galore
+Generates FastQC reports
+2. Alignment
+bash alignment_bwa-mem.sh qc_output/ reference.fa output/ --threads 4
 
-        CMV_Pipeline_Project/
-        ├── scripts/
-        │   ├── cmv_pipeline_gui.py          # Main window application
-        │   ├── app.py                       # Interactive report
-        │   ├── alignment_bwa-mem.sh         # Alignment script
-        │   ├── filtering.sh                 # Trimming and FastQC
-        │   ├── index_genome.sh              # Indexing
-        │   ├── split_interleaved_fastq.sh   # Splitting interleaved reads
-        │   ├── unaligned_reads.sh           # Extract unmapped reads
-        │   ├── variant_calling_vaf.sh       # Variant calling
-        │   ├── 02_blast_cmv_summary.sh      # BLAST
-        │   ├── extract_cmv_bam_metrics.py   # Coverage metrics
-        │   └── summarize_blast_hits.py      # BLAST summaries
-        ├── fastq/                           # Example FASTQs
-        ├── output/                          # Outputs: BAMs, CSVs, VCFs, plots
-        ├── References/                      # Reference genomes
-        ├── Simulated_Reads/                 # Simulated data
-        ├── TEST/                            # Small test datasets
-        ├── environment.yml                  # Conda environment
-        └── requirements.txt                 # Python dependencies
+This step:
 
-8. Tips if You Get Stuck
+Aligns reads to CMV reference
+Produces sorted BAM files
+Generates alignment statistics
+3. Extract Unaligned Reads
+bash unaligned_reads.sh output/BAM results/
 
-    If nothing appears in the report, check that your CSV and BLAST folders are set correctly.
+This extracts reads where both mates are unmapped for further analysis.
 
-    If FastQC previews look odd, use the download button to open them locally.
+4. BLAST Analysis
+bash 02_blast_cmv_summary.sh input_fastq/ blast_db/ results/ 4
 
-    If the report looks empty, try lowering the “BLAST min % identity” in the sidebar.
+This step:
 
-    To reset things, close the browser tab, go back to your terminal, and restart the app.
+Converts FASTQ to FASTA
+Runs BLAST against viral database
+Produces summary CSV files
+5. Variant Calling
+bash variant_calling_vaf.sh output/BAM reference.fa results/
+
+This step:
+
+Calls variants using LoFreq
+Calculates allele frequencies
+6. Variant Annotation
+bash annotate_vcfs_snpeff.sh results/vcf snpeff_db/
+
+This step:
+
+Annotates variants
+Identifies potential resistance mutations
+7. Visualisation
+streamlit run app.py
+
+This launches an interactive report to explore results.
+
+Pipeline Outputs
+
+The pipeline generates several output files:
+
+File	Description
+*_summary.csv	Alignment-based CMV metrics
+*_gene.csv	Gene-level coverage
+*_per_base.csv	Per-base depth values
+*_blast.tsv	Raw BLAST hits
+*_blast_top5.csv	Top species matches
+*_vaf.tsv	Variant allele frequencies
+*.annot.vcf	Annotated variants
+Detection Approach
+
+CMV detection is based on three complementary metrics:
+
+Reads per million (RPM) – reflects viral abundance
+Genome breadth – reflects how much of the genome is covered
+BLAST identity – confirms sequence specificity
+
+These metrics are combined to improve sensitivity and specificity and reduce false positives.
+
+Project Structure
+CMV_Pipeline/
+├── scripts/
+│   ├── filtering.sh
+│   ├── alignment_bwa-mem.sh
+│   ├── unaligned_reads.sh
+│   ├── 02_blast_cmv_summary.sh
+│   ├── variant_calling_vaf.sh
+│   ├── annotate_vcfs_snpeff.sh
+│   ├── build_snpeff_db.sh
+│   ├── index_genome.sh
+│   ├── split_interleaved_fastq.sh
+│   ├── extract_cmv_bam_metrics.py
+│   ├── summarize_blast_hits.py
+│   ├── app.py
+├── outputs/
+│   ├── BAM/
+│   ├── blast_output/
+│   ├── vcf/
+│   ├── vaf_tables/
+├── README.md
+Description of Key Components
+filtering.sh
+Performs read trimming and quality control.
+alignment_bwa-mem.sh
+Aligns reads to the CMV reference genome and produces BAM files.
+02_blast_cmv_summary.sh
+Runs BLAST against a viral database and summarises species matches.
+variant_calling_vaf.sh
+Calls variants and calculates allele frequencies.
+annotate_vcfs_snpeff.sh
+Adds functional annotations to variants.
+app.py
+Streamlit application for visualising pipeline outputs.
+Logs and Outputs
+Intermediate and final outputs are written to the specified output directory
+FastQC reports are generated for quality assessment
+CSV files summarise key results for downstream interpretation
+Common Issues
+Missing tools
+Ensure all dependencies are installed and available in PATH
+BLAST performance issues
+Increase number of threads
+Alignment errors
+Ensure reference genome is properly indexed
+Empty outputs
+Check input FASTQ quality and read counts
+Limitations
+Developed using synthetic datasets
+Requires validation on real clinical samples
+Dependent on quality of reference genome and database
