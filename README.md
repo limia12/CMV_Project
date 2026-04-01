@@ -239,6 +239,7 @@ python cmv_pipeline_gui.py
     bash annotate_vcfs_snpeff.sh variant_results/vcf snpeff_db/ 4
     streamlit run app.py
 
+```bash 
 CMV_Pipeline/
 ├── scripts/
 │   ├── filtering.sh
@@ -259,6 +260,7 @@ CMV_Pipeline/
 │   ├── vcf/
 │   ├── vaf_tables/
 ├── README.md
+```
 
 ## Description of Key Components
     filtering.sh: trims paired-end reads and runs FastQC
