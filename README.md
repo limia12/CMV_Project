@@ -293,7 +293,8 @@ CMV_Pipeline/
     Annotated VCF files
     Coverage summary CSV files
     Interactive Streamlit visualisations
-    Common Issues
+    
+## Common Issues
     Tool not found: ensure the conda environment is activated and required software is installed
     Reference indexing errors: ensure the reference FASTA exists and indexing completed successfully
     BLAST database not found: ensure makeblastdb was run and viral_nt_db.* files exist
