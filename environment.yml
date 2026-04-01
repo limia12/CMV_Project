@@ -1,36 +1,48 @@
-name: cmv-pipeline
+name: CMV_Project
 channels:
-  - bioconda
   - conda-forge
+  - bioconda
   - defaults
 
 dependencies:
   # ---- Python runtime ----
-  - python=3.11
+  - python=3.10
   - pip
   - pandas>=2.2,<3
   - numpy>=1.26
   - matplotlib>=3.8
   - seaborn>=0.13
   - pysam>=0.22
-  - tk                    # tkinter for the GUI
+  - tk                      # tkinter for the GUI
+  - streamlit>=1.33         # interactive report
+  - plotly>=5.20,<6
 
   # ---- CLI tools used in your bash scripts ----
-  - blast>=2.13           # provides blastn
+  - blast>=2.13             # provides blastn
   - seqtk>=1.3
   - bwa>=0.7.17
+  - bowtie2=2.5.4           # modern build
   - samtools>=1.18
+  - bcftools>=1.18
+  - htslib>=1.18            # provides bgzip + tabix (used in snpEff annotate)
   - picard>=3.0
   - fastqc>=0.12
   - trim-galore>=0.6
   - cutadapt>=4.0
+  - bedtools>=2.31          # commonly needed by variant/coverage steps
   - parallel
   - pigz
   - pbzip2
   - gzip
-  - coreutils             # provides stdbuf
+  - coreutils               # provides stdbuf
+  - openjdk>=17             # for Picard & snpEff
 
-  - openjdk>=17           # for Picard
+  # ---- Variant caller ----
+  - lofreq>=2.1.5
 
-  # ---- Optional (for GUI IGV launch) ----
-  # - igv
+  # ---- Annotation (snpEff) ----
+  - snpeff>=5.1.4
+  - snpsift>=5.1.4
+
+  # ---- Optional GUI helpers ----
+  - igv     
